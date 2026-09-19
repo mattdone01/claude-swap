@@ -11,6 +11,7 @@ import shutil
 import threading
 import sys
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -91,6 +92,10 @@ from claude_swap.usage_store import (
     UsageStore,
     with_sentinel,
 )
+
+ActivationGuard = Callable[
+    [dict[str, UsageEntry], float, dict[str, object]], str | None
+]
 
 # Service name under which the legacy ``keyring`` backend stored per-account
 # backup credentials on macOS (kept for the one-time keyring → security migration
@@ -1874,26 +1879,36 @@ class ClaudeAccountSwitcher:
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
 
-        # resolve_account migrates org fields and hard-errors on ambiguity.
-        account_num, email, _ = self.resolve_account(identifier)
+        # Share the switch transaction's account lock. The final autoswitch
+        # eligibility check reads this flag under the same lock, so disable
+        # cannot land between that check and the live credential write.
+        with FileLock(self.lock_file):
+            # resolve_account migrates org fields and hard-errors on ambiguity.
+            account_num, email, _ = self.resolve_account(identifier)
 
-        data = self._get_sequence_data() or {}
-        record = data.get("accounts", {}).get(account_num)
-        if not record:
-            raise AccountNotFoundError(f"Account-{account_num} does not exist")
+            data = self._get_sequence_data() or {}
+            record = data.get("accounts", {}).get(account_num)
+            if not record:
+                raise AccountNotFoundError(f"Account-{account_num} does not exist")
 
-        verb = "disabled" if disabled else "enabled"
-        if bool(record.get("disabled")) == disabled:
+            verb = "disabled" if disabled else "enabled"
+            if bool(record.get("disabled")) == disabled:
+                already = True
+            else:
+                already = False
+                if disabled:
+                    record["disabled"] = True
+                else:
+                    record.pop("disabled", None)
+                data["lastUpdated"] = get_timestamp()
+                self._write_json(self.sequence_file, data)
+                self._logger.info(
+                    f"{verb.capitalize()} account {account_num}: {email}"
+                )
+
+        if already:
             print(dimmed(f"Account-{account_num} ({email}) is already {verb}."))
             return
-
-        if disabled:
-            record["disabled"] = True
-        else:
-            record.pop("disabled", None)
-        data["lastUpdated"] = get_timestamp()
-        self._write_json(self.sequence_file, data)
-        self._logger.info(f"{verb.capitalize()} account {account_num}: {email}")
 
         print(f"{accent(verb.capitalize())} Account-{account_num} ({email}).")
 
@@ -5611,8 +5626,12 @@ class ClaudeAccountSwitcher:
         """
         from_ref = op["from"]
         to_ref = op["to"]
-        switched = from_ref != to_ref
-        if switched:
+        refusal = op.get("reason")
+        switched = from_ref != to_ref and refusal is None
+        if refusal is not None:
+            reason = refusal
+            message = f"Switch cancelled: {refusal}"
+        elif switched:
             reason = "switched"
             message = f"Switched to Account-{to_ref['number']} ({to_ref['email']})"
         else:
@@ -6051,7 +6070,14 @@ class ClaudeAccountSwitcher:
         )
 
     def switch_to(
-        self, identifier: str, json_output: bool = False, force: bool = False
+        self,
+        identifier: str,
+        json_output: bool = False,
+        force: bool = False,
+        *,
+        expected_current: str | None = None,
+        activation_guard: ActivationGuard | None = None,
+        activation_models: tuple[str, ...] = (),
     ) -> dict | None:
         """Switch to specific account.
 
@@ -6151,12 +6177,19 @@ class ClaudeAccountSwitcher:
                         message=f"Already on Account-{target_account} ({email})",
                     )
 
-        op = self._perform_switch(
-            target_account,
-            emit_output=not json_output,
-            force_activate=force,
-            provenance=provenance,
-        )
+        perform_kwargs = {
+            "emit_output": not json_output,
+            "force_activate": force,
+            "provenance": provenance,
+        }
+        # Keep the long-standing internal call shape unchanged for ordinary
+        # manual switches; auto supplies these together for its final guard.
+        if expected_current is not None:
+            perform_kwargs["expected_current"] = expected_current
+        if activation_guard is not None:
+            perform_kwargs["activation_guard"] = activation_guard
+            perform_kwargs["activation_models"] = activation_models
+        op = self._perform_switch(target_account, **perform_kwargs)
         result = self._switch_result_from_op(op, "direct") if json_output else None
         # A forced self-activation really rewrote the live credentials from the
         # stored backup — "already-active" would misdescribe that mutation.
@@ -6542,6 +6575,9 @@ class ClaudeAccountSwitcher:
         emit_output: bool = True,
         force_activate: bool = False,
         provenance: dict | None = None,
+        expected_current: str | None = None,
+        activation_guard: ActivationGuard | None = None,
+        activation_models: tuple[str, ...] = (),
     ) -> dict:
         """Perform the actual account switch with transaction support.
 
@@ -6608,15 +6644,44 @@ class ClaudeAccountSwitcher:
         with FileLock(self.lock_file), claude_credentials_lock(), claude_config_lock():
             data = self._get_sequence_data()
             active_account = data.get("activeAccountNumber")
-            current_account = str(active_account) if active_account is not None else None
+            recorded_current = (
+                str(active_account) if active_account is not None else None
+            )
+            live_current = None
             target_email = data["accounts"][target_account]["email"]
             to_ref = account_ref(int(target_account), target_email)
             current_identity = self._get_current_account()
             if current_identity is not None:
                 current_email, current_org_uuid = current_identity
-                current_account = self._find_account_slot(
+                live_current = self._find_account_slot(
                     data, current_email, current_org_uuid
                 )
+            # A guarded autoswitch must prove the exact live account still
+            # matches its decision. Recorded state is only a manual-path
+            # fallback; after logout or an unmanaged login it is stale.
+            current_account = (
+                live_current if expected_current is not None
+                else (
+                    live_current
+                    if current_identity is not None
+                    else recorded_current
+                )
+            )
+
+            if expected_current is not None and current_account != expected_current:
+                if current_account is not None:
+                    live_email = data["accounts"][current_account]["email"]
+                    current_ref = account_ref(int(current_account), live_email)
+                elif current_identity is not None:
+                    current_ref = account_ref(None, current_identity[0])
+                else:
+                    current_ref = None
+                return {
+                    "from": current_ref,
+                    "to": current_ref,
+                    "warnings": warnings_out,
+                    "reason": "active-account-changed",
+                }
 
             config_path = self._get_claude_config_path()
 
@@ -6720,11 +6785,24 @@ class ClaudeAccountSwitcher:
                 creds_written = False
                 config_written = False
                 try:
-                    self._write_credentials(
-                        self._prepare_credentials_for_activation(
-                            target_creds, rollback_creds
-                        )
+                    prepared_target_creds = self._prepare_credentials_for_activation(
+                        target_creds, rollback_creds
                     )
+                    refusal = self._guarded_activation_write(
+                        prepared_target_creds,
+                        target_account,
+                        target_config,
+                        data,
+                        activation_guard,
+                        activation_models,
+                    )
+                    if refusal is not None:
+                        return {
+                            "from": from_ref,
+                            "to": from_ref,
+                            "warnings": warnings_out,
+                            "reason": refusal,
+                        }
                     creds_written = True
 
                     # Mirror the normal switch path: preserve existing local
@@ -6997,11 +7075,24 @@ class ClaudeAccountSwitcher:
                     )
 
                 # Step 3: Activate target account - credentials
-                self._write_credentials(
-                    self._prepare_credentials_for_activation(
-                        target_creds, original_creds
-                    )
+                prepared_target_creds = self._prepare_credentials_for_activation(
+                    target_creds, original_creds
                 )
+                refusal = self._guarded_activation_write(
+                    prepared_target_creds,
+                    target_account,
+                    target_config,
+                    data,
+                    activation_guard,
+                    activation_models,
+                )
+                if refusal is not None:
+                    return {
+                        "from": from_ref,
+                        "to": from_ref,
+                        "warnings": warnings_out,
+                        "reason": refusal,
+                    }
                 transaction.record_step("credentials_written")
                 self._logger.info("Wrote target credentials")
 
@@ -7080,6 +7171,70 @@ class ClaudeAccountSwitcher:
             data["accounts"][target_account].get("organizationUuid", ""),
         )
         return {"from": from_ref, "to": to_ref, "warnings": warnings_out}
+
+    def _guarded_activation_write(
+        self,
+        credentials: str,
+        target_account: str,
+        target_config: str,
+        data: dict,
+        guard: ActivationGuard | None,
+        models: tuple[str, ...],
+    ) -> str | None:
+        """Revalidate usage and write live credentials in one usage-store lock.
+
+        The caller already holds the account and Claude credential/config
+        locks. Keeping the raw store read, pure guard, and active credential
+        write together closes a concurrent usage failure between the final
+        decision and activation. No collection, fetching, or store mutation is
+        allowed through this guard.
+        """
+        if guard is None:
+            self._write_credentials(credentials)
+            return None
+        identities = {
+            str(num): (
+                account.get("email", ""),
+                account.get("organizationUuid", "") or "",
+            )
+            for num, account in data.get("accounts", {}).items()
+        }
+        target = data.get("accounts", {}).get(target_account)
+        target_kind = (
+            "api_key"
+            if isinstance(target, dict) and target.get("kind") == "api_key"
+            else "oauth"
+        )
+        context: dict[str, object] = {
+            "number": target_account,
+            "email": target.get("email", "") if isinstance(target, dict) else "",
+            "organizationUuid": (
+                target.get("organizationUuid", "") or ""
+                if isinstance(target, dict) else ""
+            ),
+            "kind": target_kind,
+            "credentialKind": (
+                "api_key" if looks_like_api_key(credentials) else "oauth"
+            ),
+            "credentialFingerprint": oauth.credential_fingerprint(credentials),
+            "autoSwitchable": bool(
+                isinstance(target, dict)
+                and not self._disabled_from_data(data, target_account)
+                and any(
+                    str(number) == target_account
+                    for number in data.get("sequence", [])
+                )
+                and credentials
+                and target_config
+            ),
+        }
+        with self._usage_store._lock():
+            entries = self._usage_store.entries(identities, models)
+            refusal = guard(entries, self._usage_store.clock(), context)
+            if refusal is not None:
+                return refusal
+            self._write_credentials(credentials)
+        return None
 
     def _print_switch_followup(self) -> None:
         """Print the note after a successful switch, keyed to where the active

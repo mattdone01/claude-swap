@@ -96,6 +96,13 @@ FRESHEN_BUFFER_MS = 10 * 60 * 1000
 MAX_SLEEP_S = poll_policy.EXHAUSTED_INTERVAL_S
 NO_RESET_FALLBACK_S = 300.0
 
+# A below-threshold active reading is evidence for staying put, so it must be
+# materially fresher than a conservative high-water reading that already says
+# to move. Keep this engine-only: UsageStore's longer trust bridge remains the
+# display/shared-cache contract, while auto-switch refuses to let an old low
+# watermark suppress escalation indefinitely.
+ACTIVE_LOW_STALE_OK_S = poll_policy.ACTIVE_MAX_INTERVAL_S
+
 # Idle-hold cap (elapsed, not ticks — the hold itself slows the cadence to
 # NO_RESET_FALLBACK_S): an owned-and-expired token normally means Claude Code
 # is idle and will self-heal on next use, but a *dead* refresh token with an
@@ -306,9 +313,13 @@ class PollEvent(AutoSwitchEvent):
     active: dict | None  # account_ref shape, or None
     headroom: dict[str, float | None]  # account number → headroom pct (None=unknown)
     threshold: float
-    # account number → last fetch-error cause ("http-429", "timeout", ...) for
-    # accounts whose usage is unknown this tick. Additive field.
+    # account number → last fetch-error cause ("http-429", "timeout", ...).
+    # Reported even while a last-good measurement remains decision-trusted, so
+    # degraded telemetry cannot hide behind a plausible-looking percentage.
     fetch_errors: dict[str, str] = field(default_factory=dict)
+    # account number → age of its last successful usage measurement.
+    # Additive diagnostic field; absent for accounts never fetched successfully.
+    usage_age_seconds: dict[str, float] = field(default_factory=dict)
     # account number → ordered window label → utilization pct ("5h", "7d",
     # then scoped model display names). Additive field: the binding pct alone
     # (e.g. "89%") hides which window binds — #115 was reported off that
@@ -323,6 +334,8 @@ class PollEvent(AutoSwitchEvent):
         }
         if self.fetch_errors:
             fields["fetchErrors"] = self.fetch_errors
+        if self.usage_age_seconds:
+            fields["usageAgeSeconds"] = self.usage_age_seconds
         if self.windows:
             fields["windowsPct"] = self.windows
         return fields
@@ -330,12 +343,30 @@ class PollEvent(AutoSwitchEvent):
     def _describe(self, num: str) -> str:
         wins = self.windows.get(num)
         if wins:
-            return " · ".join(f"{name} {pct:.0f}%" for name, pct in wins.items())
+            value = " · ".join(f"{name} {pct:.0f}%" for name, pct in wins.items())
+            return value + self._diagnostic_suffix(num)
         h = self.headroom.get(num)
         if h is not None:
-            return f"{100 - h:.0f}%"
+            return f"{100 - h:.0f}%" + self._diagnostic_suffix(num)
         err = self.fetch_errors.get(num)
-        return f"? ({err})" if err else "?"
+        return (f"? ({err})" if err else "?") + self._age_suffix(num)
+
+    def _age_suffix(self, num: str) -> str:
+        age = self.usage_age_seconds.get(num)
+        if age is None or age < 1:
+            return ""
+        if age < 60:
+            label = f"{age:.0f}s"
+        elif age < 3600:
+            label = f"{age / 60:.0f}m"
+        else:
+            label = f"{age / 3600:.1f}h"
+        return f" · {label} old"
+
+    def _diagnostic_suffix(self, num: str) -> str:
+        suffix = self._age_suffix(num)
+        error = self.fetch_errors.get(num)
+        return suffix + (f" · last fetch {error}" if error else "")
 
     def human(self) -> str:
         if self.active is None:
@@ -343,10 +374,11 @@ class PollEvent(AutoSwitchEvent):
         num = self.active.get("number")
         h = self.headroom.get(str(num))
         if h is not None:
-            used = f"{100 - h:.0f}% used"
+            used = f"{100 - h:.0f}% used" + self._diagnostic_suffix(str(num))
         else:
             err = self.fetch_errors.get(str(num))
             used = f"usage unknown ({err})" if err else "usage unknown"
+            used += self._age_suffix(str(num))
         others = ", ".join(
             f"#{n}: {self._describe(n)}"
             for n in self.headroom
@@ -630,6 +662,88 @@ def _headroom_by_account(
     }
 
 
+def _long_429_backoff(entry) -> bool:
+    """Whether a 429 committed this row past one active poll ceiling.
+
+    Compare the committed span, not remaining time. The same failure must not
+    alternate between unavailable and healthy as its deadline approaches.
+    """
+    return bool(
+        entry is not None
+        and entry.last_error == "http-429"
+        and entry.last_attempt_at is not None
+        and entry.backoff_until is not None
+        and entry.backoff_until - entry.last_attempt_at
+        > poll_policy.ACTIVE_MAX_INTERVAL_S
+    )
+
+
+def _active_decision_value(
+    entry, threshold: float, models: tuple[str, ...]
+) -> dict | str | None:
+    """Engine view of active usage, stricter only for low-water evidence."""
+    if entry is None:
+        return None
+    value = entry.decision_value()
+    if not isinstance(value, dict):
+        return value
+    pct = binding_pct(value, models)
+    if pct is not None and pct < threshold:
+        if (entry.age_s or 0.0) > ACTIVE_LOW_STALE_OK_S:
+            return None
+        if _long_429_backoff(entry):
+            return None
+    return value
+
+
+def _candidate_is_fresh(entry, now: float) -> bool:
+    """OAuth targets need current usage and no committed long 429."""
+    return bool(entry is not None and entry.fresh(now) and not _long_429_backoff(entry))
+
+
+def _candidate_can_rank(entry, now: float, models: tuple[str, ...]) -> bool:
+    """Keep unknown/exhausted evidence, but never rank a stale usable target."""
+    if entry is None:
+        return True
+    value = entry.decision_value()
+    if not isinstance(value, dict):
+        return True
+    headroom = oauth.account_headroom(value, models)
+    if headroom is not None and headroom <= 0:
+        return True
+    return _candidate_is_fresh(entry, now)
+
+
+def _activation_refusal(
+    entries: dict,
+    now: float,
+    current: str,
+    target: str,
+    trigger: str,
+    threshold: float,
+    models: tuple[str, ...],
+    *,
+    require_fresh_target: bool = True,
+) -> str | None:
+    """Pure final check for the source decision and target telemetry."""
+    active_value = _active_decision_value(entries.get(current), threshold, models)
+    active_headroom = oauth.account_headroom(
+        active_value if isinstance(active_value, dict) else None, models
+    )
+    if trigger == "failover":
+        if active_headroom is not None:
+            return "active-usage-recovered"
+    elif active_headroom is None:
+        return "active-usage-unknown"
+    elif trigger == "at-limit" and active_headroom > 0:
+        return "active-no-longer-at-limit"
+    elif trigger == "proactive" and 100.0 - active_headroom < threshold:
+        return "below-threshold"
+    if require_fresh_target and not _candidate_is_fresh(entries.get(target), now):
+        return "stale-usage"
+    return None
+
+
 class AutoSwitchEngine:
     """Threshold-policy auto-switcher over a :class:`ClaudeAccountSwitcher`.
 
@@ -669,6 +783,7 @@ class AutoSwitchEngine:
         # from the TUI should show a fresh decision now, not next interval).
         self._wake = threading.Event()
         self._unhealthy_ticks = 0
+        self._current_account: str | None = None
         # Both set per tick: a known-reset sleep target, and whether a BLOCKED
         # outcome is static enough (truly exhausted / no candidates) to wait
         # longer than the normal interval.
@@ -906,6 +1021,14 @@ class AutoSwitchEngine:
         )
 
         current = self.switcher.current_account_number()
+        if current != self._current_account:
+            # Grace belongs to one active account. A manual/concurrent switch
+            # must not inherit the previous account's spent unhealthy budget or
+            # idle-token hold.
+            self._current_account = current
+            self._unhealthy_ticks = 0
+            self._idle_hold_since = None
+            self._idle_hold_slow = False
         if current is None:
             self._emit(
                 PollEvent(active=None, headroom={}, threshold=settings.threshold)
@@ -945,7 +1068,12 @@ class AutoSwitchEngine:
                 fetch_errors={
                     num: entry.last_error
                     for num, entry in entries.items()
-                    if usage.get(num) is None and entry.last_error
+                    if entry.last_error
+                },
+                usage_age_seconds={
+                    num: entry.age_s
+                    for num, entry in entries.items()
+                    if entry.age_s is not None
                 },
                 windows={
                     num: pcts
@@ -1046,7 +1174,7 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "failover"
 
-        if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+        if trigger != "at-limit" and self._in_cooldown(state):
             self._emit(NoSwitchEvent(reason="cooldown"))
             return TickOutcome.NO_ACTION
 
@@ -1056,9 +1184,22 @@ class AutoSwitchEngine:
             for num in self.switcher.switchable_account_numbers()
             if num != current and num not in quarantined
         ]
-        oauth_candidates = [
+        all_oauth_candidates = [
             n for n in candidates if self.switcher.account_kind_for(n) != "api_key"
         ]
+        decided_now = self.clock()
+        # Consume-first identifies the preferred target from reset ordering and
+        # then holds if that exact target is stale. Escape triggers instead skip
+        # stale OAuth targets and try the next fresh one.
+        oauth_candidates = (
+            all_oauth_candidates
+            if trigger == "consume-first"
+            else [
+                n
+                for n in all_oauth_candidates
+                if _candidate_can_rank(entries.get(n), decided_now, self._models)
+            ]
+        )
         # The no-return bar itself lives in `_rank` below: it is a statement
         # about the CHOICE, so it belongs where the choice is made rather than
         # in this census of what exists. See `_no_return_account` for the
@@ -1092,6 +1233,14 @@ class AutoSwitchEngine:
             )
             return TickOutcome.NO_ACTION
         if not oauth_candidates and not api_key_candidates:
+            if all_oauth_candidates:
+                self._emit(
+                    NoSwitchEvent(
+                        reason="no-fresh-candidate",
+                        detail="no OAuth candidate has fresh, usable telemetry",
+                    )
+                )
+                return TickOutcome.BLOCKED
             # Won't change until the user adds/recovers an account — no point
             # re-polling at full cadence.
             self._blocked_wait_long = True
@@ -1173,7 +1322,6 @@ class AutoSwitchEngine:
                     return unbarred
             return ranked
 
-        decided_now = self.clock()
         ordered, any_known, active_reset_ts = _rank(
             trigger=trigger,
             consume_first=consume_first,
@@ -1202,6 +1350,9 @@ class AutoSwitchEngine:
                 fetch={current, *candidates}
             )
             usage = {num: entry.decision_value() for num, entry in entries.items()}
+            usage[current] = _active_decision_value(
+                entries.get(current), settings.threshold, self._models
+            )
             headroom = _headroom_by_account(usage, self._models)
             active_headroom = headroom.get(current)
             decided_now = self.clock()
@@ -1217,11 +1368,13 @@ class AutoSwitchEngine:
                 now=decided_now,
             )
 
+        using_api_key_fallback = False
         if not ordered and api_key_candidates and trigger != "consume-first":
             # Last resort when we must move: metered API-key accounts
             # (unmeasurable headroom). Never for a below-threshold consume-first
             # nudge — those API-key accounts have no weekly window to consume.
             ordered = api_key_candidates
+            using_api_key_fallback = True
 
         if not ordered:
             if not any_known:
@@ -1312,7 +1465,13 @@ class AutoSwitchEngine:
         transient_failure = False
         systemic = ""
         for num in ordered:
-            email = self.switcher.account_email(num)
+            expected_identity = self.switcher.account_identity(num)
+            email = expected_identity["email"]
+            expected_target = (
+                email,
+                expected_identity["organizationUuid"],
+                "api_key" if using_api_key_fallback else "oauth",
+            )
             if trigger == "consume-first":
                 # The phase-2 refetch is best-effort: the collector refuses
                 # accounts in failure backoff or claimed by a concurrent
@@ -1320,7 +1479,7 @@ class AutoSwitchEngine:
                 # is opportunistic, not an escape — never act on stale data
                 # or slide to a worse-ranked target; hold and retry next tick.
                 entry = entries.get(num)
-                if entry is None or not entry.fresh(self.clock()):
+                if not _candidate_is_fresh(entry, self.clock()):
                     self._emit(
                         NoSwitchEvent(
                             reason="stale-usage",
@@ -1335,7 +1494,7 @@ class AutoSwitchEngine:
             if self.dry_run:
                 # Dry-run stops at the decision: no token refresh, no
                 # quarantine writes — freshening is a mutation.
-                return self._perform(num, email, trigger, left_snapshot)
+                return self._perform(num, email, trigger, left_snapshot, current)
             status = self._freshen_target(num, email)
             if status == "identity-conflict":
                 # The slot's credential is alive but belongs to a different
@@ -1343,9 +1502,11 @@ class AutoSwitchEngine:
                 # account. Quarantine (auto-released once a re-add replaces
                 # the credential).
                 self._quarantine(num, email, "identity-conflict")
+                quarantined.add(num)
                 continue
             if status == "invalid_grant":
                 self._quarantine(num, email, "invalid_grant")
+                quarantined.add(num)
                 continue
             if status == "transient":
                 transient_failure = True
@@ -1366,7 +1527,139 @@ class AutoSwitchEngine:
                 continue
             if status == "skip-live-session":
                 continue
-            return self._perform(num, email, trigger, left_snapshot)
+
+            def final_refusal(final_entries, final_now, activation=None):
+                if activation is not None:
+                    actual_target = (
+                        activation.get("email", ""),
+                        activation.get("organizationUuid", ""),
+                        activation.get("kind", "oauth"),
+                    )
+                    if (
+                        not activation.get("autoSwitchable")
+                        or actual_target != expected_target
+                        or activation.get("credentialKind") != expected_target[2]
+                    ):
+                        return "target-no-longer-eligible"
+                    target_entry = final_entries.get(num)
+                    target_fp = activation.get("credentialFingerprint")
+                    if (
+                        target_entry is not None
+                        and target_entry.token_dead(
+                            stored_fp=target_fp if isinstance(target_fp, str) else None
+                        )
+                    ):
+                        return "target-auth-dead"
+                refusal = _activation_refusal(
+                    final_entries,
+                    final_now,
+                    current,
+                    num,
+                    trigger,
+                    settings.threshold,
+                    self._models,
+                    require_fresh_target=expected_target[2] != "api_key",
+                )
+                if refusal is not None:
+                    return refusal
+                if expected_target[2] == "api_key":
+                    return None
+                final_usage = {
+                    n: entry.decision_value()
+                    for n, entry in final_entries.items()
+                }
+                final_usage[current] = _active_decision_value(
+                    final_entries.get(current), settings.threshold, self._models
+                )
+                final_headroom = _headroom_by_account(final_usage, self._models)
+                final_candidates = (
+                    [n for n in all_oauth_candidates if n not in quarantined]
+                    if trigger == "consume-first"
+                    else [
+                        n
+                        for n in all_oauth_candidates
+                        if n not in quarantined
+                        if _candidate_can_rank(
+                            final_entries.get(n), final_now, self._models
+                        )
+                    ]
+                )
+                reranked, _, _ = _rank(
+                    trigger=trigger,
+                    consume_first=consume_first,
+                    oauth_candidates=final_candidates,
+                    usage=final_usage,
+                    headroom=final_headroom,
+                    current=current,
+                    active_headroom=final_headroom.get(current),
+                    settings=settings,
+                    now=final_now,
+                )
+                if not reranked or reranked[0] != num:
+                    return "target-no-longer-eligible"
+                return None
+
+            if expected_target[2] == "api_key":
+                # Permission comes from the decision snapshot, never from a
+                # later roster reread. An OAuth target replaced with an API
+                # key after ranking was not an opted-in fallback candidate.
+                api_key_authorized = (
+                    settings.include_api_key_accounts
+                    and using_api_key_fallback
+                    and trigger != "consume-first"
+                )
+                if not api_key_authorized:
+                    if trigger == "consume-first":
+                        return self._hold_activation_refusal(
+                            "target-no-longer-eligible", num
+                        )
+                    continue
+                # Explicit API-key fallback has no usage endpoint or OAuth
+                # freshness contract. Keep its existing opt-in behavior; the
+                # switcher's locked roster check still protects it.
+                return self._perform(
+                    num,
+                    email,
+                    trigger,
+                    left_snapshot,
+                    current,
+                    activation_guard=final_refusal,
+                )
+
+            # Freshening can take long enough for either measurement to cross
+            # its safety boundary, and another collector can commit a 429 in
+            # the meantime. Re-read the store without fetching before entering
+            # the switch transaction. Escape triggers may try the next ranked
+            # target; consume-first holds on its preferred target.
+            final_entries = self.switcher.usage_entries_by_account(fetch=set())
+            final_now = self.clock()
+            refusal = final_refusal(final_entries, final_now)
+            if refusal in {"stale-usage", "target-no-longer-eligible"} and (
+                trigger != "consume-first"
+            ):
+                continue
+            if refusal is not None:
+                return self._hold_activation_refusal(refusal, num)
+
+            final_active = _active_decision_value(
+                final_entries.get(current), settings.threshold, self._models
+            )
+            final_headroom = oauth.account_headroom(
+                final_active if isinstance(final_active, dict) else None,
+                self._models,
+            )
+            left_snapshot = (
+                final_headroom,
+                _binding_recovery_ts(final_active, self._models, final_now),
+            )
+            return self._perform(
+                num,
+                email,
+                trigger,
+                left_snapshot,
+                current,
+                activation_guard=final_refusal,
+            )
 
         if systemic or transient_failure:
             self._emit(
@@ -2049,16 +2342,19 @@ class AutoSwitchEngine:
             # nomination preserves a valid future plan under the store lock.
             scheduled=not stale_candidate_plan,
         )
+        # The caller's tick-snapshotted threshold, so one tick fetches and
+        # decides on the same value even if apply_threshold() lands mid-tick.
+        if threshold is None:
+            threshold = self.settings.threshold
         usage = {num: entry.decision_value() for num, entry in entries.items()}
+        usage[current] = _active_decision_value(
+            entries.get(current), threshold, self._models
+        )
 
         active_value = usage.get(current)
         active_headroom = oauth.account_headroom(
             active_value if isinstance(active_value, dict) else None, self._models
         )
-        # The caller's tick-snapshotted threshold, so one tick fetches and
-        # decides on the same value even if apply_threshold() lands mid-tick.
-        if threshold is None:
-            threshold = self.settings.threshold
         escalate = bool(candidates) and (
             (active_headroom is None and active_value != USAGE_TOKEN_EXPIRED)
             or (
@@ -2092,9 +2388,50 @@ class AutoSwitchEngine:
                 fetch=escalation_fetch
             )
             usage = {num: entry.decision_value() for num, entry in entries.items()}
+            usage[current] = _active_decision_value(
+                entries.get(current), threshold, self._models
+            )
 
         headroom = _headroom_by_account(usage, self._models)
         return entries, usage, headroom
+
+    def _hold_activation_refusal(
+        self, reason: str, target: str
+    ) -> TickOutcome:
+        """Report a final-boundary refusal without mutating switch state."""
+        if reason == "active-usage-unknown":
+            self._idle_hold_since = None
+            self._unhealthy_ticks += 1
+            self._emit(
+                NoSwitchEvent(
+                    reason=reason,
+                    detail=(
+                        f"{self._unhealthy_ticks}/{self.settings.unhealthy_ticks} "
+                        "before failover; telemetry changed before activation"
+                    ),
+                )
+            )
+            return TickOutcome.NO_ACTION
+        if reason in {
+            "active-usage-recovered",
+            "active-no-longer-at-limit",
+            "below-threshold",
+        }:
+            self._unhealthy_ticks = 0
+        details = {
+            "active-usage-recovered": "active telemetry recovered before activation",
+            "active-no-longer-at-limit": "active account recovered before activation",
+            "below-threshold": "active account fell below the switch threshold",
+            "stale-usage": f"account {target} telemetry became stale before activation",
+            "target-no-longer-eligible": (
+                f"account {target} no longer qualifies on current usage"
+            ),
+            "target-auth-dead": (
+                f"account {target} credential was rejected before activation"
+            ),
+        }
+        self._emit(NoSwitchEvent(reason=reason, detail=details.get(reason, "")))
+        return TickOutcome.NO_ACTION
 
     def _perform(
         self,
@@ -2102,6 +2439,8 @@ class AutoSwitchEngine:
         email: str,
         trigger: str,
         left: tuple[float | None, float],
+        expected_current: str,
+        activation_guard=None,
     ) -> TickOutcome:
         if self.dry_run:
             current = self.switcher.current_account_number()
@@ -2124,16 +2463,54 @@ class AutoSwitchEngine:
         # state lock.
         with self._state_lock():
             state = self._read_state()
-            if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+            actual_current = self.switcher.current_account_number()
+            if actual_current != expected_current:
+                self._emit(
+                    NoSwitchEvent(
+                        reason="active-account-changed",
+                        detail=(
+                            f"expected account {expected_current}, found "
+                            f"{actual_current or 'unmanaged'}; decision discarded"
+                        ),
+                    )
+                )
+                return TickOutcome.NO_ACTION
+            quarantine = state.get("quarantine")
+            if isinstance(quarantine, dict) and number in quarantine:
+                self._emit(
+                    NoSwitchEvent(
+                        reason="target-quarantined",
+                        detail=f"account {number} was quarantined before activation",
+                    )
+                )
+                return TickOutcome.BLOCKED
+            if trigger != "at-limit" and self._in_cooldown(state):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 
-            result = self.switcher.switch_to(number, json_output=True)
+            result = self.switcher.switch_to(
+                number,
+                json_output=True,
+                expected_current=expected_current,
+                activation_guard=activation_guard,
+                activation_models=self._models,
+            )
             if not result or not result.get("switched"):
+                reason = (result or {}).get("reason", "already-active")
+                if reason in {
+                    "active-usage-unknown",
+                    "active-usage-recovered",
+                    "active-no-longer-at-limit",
+                    "below-threshold",
+                    "stale-usage",
+                    "target-no-longer-eligible",
+                    "target-auth-dead",
+                }:
+                    return self._hold_activation_refusal(reason, number)
                 self._emit(
                     NoSwitchEvent(
-                        reason="already-active",
-                        detail=(result or {}).get("reason", ""),
+                        reason=reason,
+                        detail=(result or {}).get("message", ""),
                     )
                 )
                 return TickOutcome.NO_ACTION

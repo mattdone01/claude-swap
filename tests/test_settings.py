@@ -172,19 +172,23 @@ class TestSettingSpecs:
 
 class TestSetUnsetSetting:
     def test_set_writes_minimal_file(self, tmp_path: Path):
-        value = set_setting(tmp_path, "autoswitch.threshold", "80")
-        assert value == 80.0
+        value = set_setting(tmp_path, "autoswitch.threshold", "35")
+        assert value == 35.0
         raw = json.loads(settings_path(tmp_path).read_text())
-        assert raw == {"schemaVersion": 1, "autoswitch": {"threshold": 80.0}}
+        assert raw == {"schemaVersion": 1, "autoswitch": {"threshold": 35.0}}
+        assert load_settings(tmp_path).threshold == 35.0
 
     def test_set_int_kind_coerces_and_rejects_floats(self, tmp_path: Path):
         assert set_setting(tmp_path, "autoswitch.unhealthyTicks", "5") == 5
         with pytest.raises(ConfigError, match="integer"):
             set_setting(tmp_path, "autoswitch.unhealthyTicks", "3.5")
 
-    def test_set_rejects_out_of_range_without_writing(self, tmp_path: Path):
-        with pytest.raises(ConfigError, match="between 50 and 99.9"):
-            set_setting(tmp_path, "autoswitch.threshold", "200")
+    @pytest.mark.parametrize("value", ["0", "100"])
+    def test_set_rejects_out_of_range_without_writing(
+        self, tmp_path: Path, value: str
+    ):
+        with pytest.raises(ConfigError, match="between 1 and 99.9"):
+            set_setting(tmp_path, "autoswitch.threshold", value)
         assert not settings_path(tmp_path).exists()
 
     def test_set_rejects_unknown_key(self, tmp_path: Path):

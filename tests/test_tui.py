@@ -1471,9 +1471,9 @@ class TestAutoScreen:
             summary = screen.query_one("#auto-summary", Static)
             # never a lying "100%"
             assert "threshold 99.9% (session)" in summary.render().plain
-            screen.action_threshold_step(-60.0)
+            screen.action_threshold_step(-100.0)
             await pilot.pause()
-            assert screen._settings.threshold == 50.0  # spec's lower bound
+            assert screen._settings.threshold == 1.0  # spec's lower bound
 
     async def test_candidates_ranked_by_headroom(self, tmp_path, fake_engine):
         fake = FakeSwitcher(
@@ -1709,4 +1709,3 @@ class TestThemeWiring:
             await menu_select(pilot, "theme:light")
             assert app._theme_name == "light"
             assert app.theme == "cswap-light"
-

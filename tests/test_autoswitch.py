@@ -31,6 +31,7 @@ from claude_swap.autoswitch import (
     pct_label,
 )
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
+from claude_swap.locking import FileLock
 from claude_swap.usage_store import FetchRecord, UsageEntry
 from claude_swap.models import Platform
 from claude_swap.settings import AutoSwitchSettings
@@ -166,10 +167,41 @@ class EngineHarness:
         return self.tick_with_entries(entries)
 
     def tick_with_entries(self, entries: dict[str, UsageEntry]) -> TickOutcome:
+        self.persist_usage_entries(entries)
         with patch.object(
             self.switcher, "usage_entries_by_account", return_value=entries
         ):
             return self.engine.tick()
+
+    def persist_usage_entries(self, entries: dict[str, UsageEntry]) -> None:
+        """Write synthetic entries through the store's identity boundary.
+
+        Collection remains mocked so a test can describe sentinels and exact
+        read-model ages, while the activation guard reads an independently
+        reconstructed, identity-bound snapshot from the real UsageStore.
+        """
+        accounts = self.switcher._get_sequence_data().get("accounts", {})
+        rows = {}
+        for num, entry in entries.items():
+            account = accounts[num]
+            rows[num] = {
+                "email": account["email"],
+                "organizationUuid": account.get("organizationUuid", "") or "",
+                "lastGood": entry.last_good,
+                "fetchedAt": entry.fetched_at,
+                "lastAttemptAt": entry.last_attempt_at,
+                "consecutiveFailures": entry.consecutive_failures,
+                "lastError": entry.last_error,
+                "backoffUntil": entry.backoff_until,
+                "nextPollAt": entry.next_poll_at,
+                "pollIntervalS": entry.poll_interval_s,
+                "last429At": entry.last_429_at,
+                "authDeadStrikes": entry.auth_dead_strikes,
+                "struckFingerprint": entry.struck_fingerprint,
+                "claimUntil": entry.claim_until,
+            }
+        with self.switcher._usage_store._lock():
+            self.switcher._usage_store._write_rows(rows)
 
     def active_number(self) -> int | None:
         return self.switcher._get_sequence_data()["activeAccountNumber"]
@@ -314,6 +346,22 @@ class TestDecisionTable:
         assert harness.active_number() == 1
         reasons = [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)]
         assert reasons == ["below-threshold"]
+
+    def test_threshold_35_holds_below_and_switches_at_boundary(self, temp_home):
+        h = EngineHarness(temp_home, threshold=35.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        below = h.tick_with_usage({"1": _usage(34.9), "2": _usage(10)})
+        assert below is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+        at_threshold = h.tick_with_usage({"1": _usage(35), "2": _usage(10)})
+        assert at_threshold is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "proactive"
 
     def test_over_threshold_switches_to_max_headroom(self, harness):
         outcome = harness.tick_with_usage({
@@ -927,11 +975,14 @@ class TestAdaptiveScheduler:
         assert counts["1"] == 3
         assert counts["2"] == 2  # now stale → the escalation refreshes it
 
-    def test_active_in_backoff_keeps_trusted_headroom(self, temp_home, monkeypatch):
-        # The active account's fetches are being refused (429 with a long
-        # Retry-After). Its last-good data ages past STALE_OK_S, but the
-        # staleness is deliberate: headroom stays known, so no unhealthy
-        # ticks and no escalate-all burst while the server is rate limiting.
+    def test_long_429_failover_respects_real_store_backoff(self, temp_home, monkeypatch):
+        """A low last-good value cannot hide a committed long 429.
+
+        This uses the real UsageStore reservation/backoff path. The engine
+        escalates, spends the configured unhealthy grace, and fails over to a
+        freshly measured alternate without issuing another active-account HTTP
+        attempt before backoffUntil.
+        """
         h = self._harness(temp_home, monkeypatch)
         usage = {"1": _usage(50), "2": _usage(10), "3": _usage(20)}
         counts: dict[str, int] = {}
@@ -944,11 +995,18 @@ class TestAdaptiveScheduler:
         )
         h.clock.advance(400)  # active data now well past STALE_OK_S, in backoff
         counts.clear()
-        outcome = self._tick(h, counts, usage)
-        assert outcome is TickOutcome.NO_ACTION
-        assert h.engine._unhealthy_ticks == 0
-        assert "1" not in counts  # backoff respected
-        assert sum(counts.values()) == 1  # baseline slot only, no escalate-all
+        outcomes = []
+        for _ in range(3):
+            outcomes.append(self._tick(h, counts, usage))
+            h.clock.advance(60)
+        assert outcomes == [
+            TickOutcome.NO_ACTION,
+            TickOutcome.NO_ACTION,
+            TickOutcome.SWITCHED,
+        ]
+        assert h.active_number() == 2
+        assert "1" not in counts  # real reservation kept every retry in backoff
+        assert counts["2"] >= 1 and counts["3"] >= 1  # phase A escalated peers
 
     def test_a_non_429_ask_is_bounded_at_its_own_trust_ceiling(
         self, temp_home, monkeypatch
@@ -1572,6 +1630,20 @@ class TestAdaptiveScheduler:
         assert "http-429" in poll.human()
         assert poll.to_json()["fetchErrors"] == {"1": "http-429"}
 
+    def test_poll_event_keeps_error_and_age_beside_trusted_usage(self):
+        poll = PollEvent(
+            active={"number": 1, "email": "a@example.com"},
+            headroom={"1": 56.0},
+            threshold=80.0,
+            fetch_errors={"1": "http-429"},
+            usage_age_seconds={"1": 7200.0},
+        )
+
+        assert poll.to_json()["fetchErrors"] == {"1": "http-429"}
+        assert poll.to_json()["usageAgeSeconds"] == {"1": 7200.0}
+        assert "2.0h old" in poll.human()
+        assert "last fetch http-429" in poll.human()
+
     def test_quarantined_candidate_never_consumes_the_poll_slot(
         self, temp_home, monkeypatch
     ):
@@ -1705,8 +1777,12 @@ class TestAdaptiveScheduler:
 class TestApiKeyAccounts:
     def _mark_api_key(self, harness, num: int) -> None:
         data = harness.switcher._get_sequence_data()
+        email = data["accounts"][str(num)]["email"]
         data["accounts"][str(num)]["kind"] = "api_key"
         harness.switcher._write_json(harness.switcher.sequence_file, data)
+        harness.switcher._write_account_credentials(
+            str(num), email, f"sk-ant-api-test-{num}"
+        )
 
     def test_api_key_candidate_excluded_by_default(self, temp_home):
         h = EngineHarness(temp_home)
@@ -1744,6 +1820,68 @@ class TestApiKeyAccounts:
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
+
+    def test_ranked_oauth_replaced_by_api_key_does_not_gain_opt_in(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        original_identity = h.switcher.account_identity
+        changed = False
+
+        def replace_before_snapshot(number):
+            nonlocal changed
+            if number == "2" and not changed:
+                changed = True
+                with FileLock(h.switcher.lock_file):
+                    data = h.switcher._get_sequence_data()
+                    data["accounts"]["2"]["kind"] = "api_key"
+                    h.switcher._write_json(h.switcher.sequence_file, data)
+                    h.switcher._write_account_credentials(
+                        "2", "b@example.com", "sk-ant-api-race"
+                    )
+            return original_identity(number)
+
+        with patch.object(
+            h.switcher, "account_identity", side_effect=replace_before_snapshot
+        ):
+            outcome = h.tick_with_usage({"1": _usage(100), "2": _usage(10)})
+
+        assert changed
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        event = next(e for e in h.events if isinstance(e, NoSwitchEvent))
+        assert event.reason == "target-no-longer-eligible"
+
+    def test_source_recovery_still_cancels_api_key_fallback(self, temp_home):
+        h = EngineHarness(
+            temp_home, include_api_key_accounts=True, unhealthy_ticks=1
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.make_live("a@example.com", 1)
+        self._mark_api_key(h, 2)
+        original = h.switcher.switch_to
+
+        def recover_source(*args, **kwargs):
+            h.switcher._usage_store.record(
+                {"1": FetchRecord(usage=_usage(10))},
+                {"1": ("a@example.com", "")},
+            )
+            return original(*args, **kwargs)
+
+        with patch.object(h.switcher, "switch_to", side_effect=recover_source):
+            outcome = h.tick_with_entries({
+                "1": UsageEntry(),
+                "2": UsageEntry(sentinel="api key"),
+            })
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        event = next(e for e in h.events if isinstance(e, NoSwitchEvent))
+        assert event.reason == "active-usage-recovered"
 
     def test_active_api_key_idles_engine(self, temp_home):
         h = EngineHarness(temp_home)
@@ -1873,13 +2011,15 @@ class TestQuarantineLifecycle:
         harness.events.clear()
         fresh_engine = harness._make_engine()
         usage = {"1": _usage(95), "2": _usage(0), "3": _usage(50)}
+        entries = {
+            num: _entry_for(value, harness.clock.now)
+            for num, value in usage.items()
+        }
+        harness.persist_usage_entries(entries)
         with patch.object(
             harness.switcher,
             "usage_entries_by_account",
-            return_value={
-                num: _entry_for(value, harness.clock.now)
-                for num, value in usage.items()
-            },
+            return_value=entries,
         ):
             outcome = fresh_engine.tick()
         # 2 has the most headroom but is quarantined → 3 wins.
@@ -3080,16 +3220,23 @@ class TestConsumeFirstStrategy:
         it happened.
         """
         fetch_sets: list[set] = []
+        phase_two_complete = False
 
         def collect(fetch=None, **_kwargs):
+            nonlocal phase_two_complete
             requested = set(fetch or ())
             fetch_sets.append(requested)
-            view = fresh if requested == {"1", "2", "3"} else stored
+            if requested == {"1", "2", "3"}:
+                phase_two_complete = True
+            view = fresh if phase_two_complete else stored
             return {
                 num: _entry_for(value, h.clock.now)
                 for num, value in view.items()
             }
 
+        h.persist_usage_entries({
+            num: _entry_for(value, h.clock.now) for num, value in fresh.items()
+        })
         with patch.object(
             h.switcher, "usage_entries_by_account", side_effect=collect
         ):
@@ -5792,6 +5939,7 @@ class TestHorizonAxisDoesNotFlap:
         ]
         for label, active_row, expected_outcome, expected_active in cases:
             h = EngineHarness(temp_home)
+            h.engine.state_path.unlink(missing_ok=True)
             h.seed(1, "a@example.com")
             h.seed(2, "b@example.com")
             h.make_live("a@example.com", 1)
@@ -5875,6 +6023,7 @@ class TestHorizonAxisDoesNotFlap:
         ]
         for label, active_row, peer_reset, expected_outcome, expected_active in cases:
             h = EngineHarness(temp_home)
+            h.engine.state_path.unlink(missing_ok=True)
             h.seed(1, "a@example.com")
             h.seed(2, "b@example.com")
             h.make_live("a@example.com", 1)
@@ -5923,16 +6072,10 @@ class TestHorizonAxisDoesNotFlap:
 
         ranking_now = 1_000_000.0
         reset_at = self._iso_at(ranking_now + 100.0)   # future at ranking_now
-        stale_reread = ranking_now + 200.0             # past reset_at
-
-        # Enough values for the OLD code's clock() call order (pre-tick
-        # check, ranking now, left_snapshot re-read, freshen expiry check,
-        # _perform's lastSwitchAt) with a couple of spares so neither code
-        # path can exhaust the sequence.
-        clock_values = iter([
-            ranking_now, ranking_now, stale_reread,
-            stale_reread, stale_reread, stale_reread,
-        ])
+        # Final boundary validation deliberately reads the clock again. Hold
+        # the instant fixed here so this test isolates departure-snapshot
+        # reuse rather than the separate freshness-drift behavior.
+        clock_values = iter([ranking_now] * 16)
         with patch.object(h.engine, "clock", side_effect=lambda: next(clock_values)):
             outcome = h.tick_with_usage({
                 "1": _usage(95, reset_at),
@@ -6180,12 +6323,20 @@ class TestHorizonAxisDoesNotFlap:
             "3": _usage7(60, 60, self._days_out(h, 400)),   # 40 pts
         }
 
+        phase_two_complete = False
+
         def _serve(fetch=frozenset(), **kw):
+            nonlocal phase_two_complete
             # The phase-2 escalation is the only call that asks for the whole
             # fleet; everything before it is the stale baseline.
-            snap = fresh if len(fetch) >= 3 else stale
+            if len(fetch) >= 3:
+                phase_two_complete = True
+            snap = fresh if phase_two_complete else stale
             return {n: _entry_for(v, h.clock.now) for n, v in snap.items()}
 
+        h.persist_usage_entries({
+            n: _entry_for(v, h.clock.now) for n, v in fresh.items()
+        })
         with patch.object(
             h.switcher, "usage_entries_by_account", side_effect=_serve
         ):
@@ -6894,3 +7045,542 @@ class TestFreshenRoutesThroughGate:
         assert gate_calls["args"][0] == "2"
         assert "called" not in direct, "freshen must not POST outside the gate"
 
+
+class TestTelemetrySafety:
+    @staticmethod
+    def _live_state(harness):
+        creds = harness.temp_home / ".claude" / ".credentials.json"
+        config = harness.temp_home / ".claude.json"
+        return (
+            creds.read_bytes() if creds.exists() else None,
+            config.read_bytes() if config.exists() else None,
+            harness.switcher.sequence_file.read_bytes(),
+        )
+
+    def test_stale_low_active_escalates_and_fails_over(self, harness):
+        now = harness.clock.now
+        entries = {
+            "1": UsageEntry(
+                last_good=_usage(44), fetched_at=now - 301, age_s=301,
+                consecutive_failures=1, last_error="timeout", trust_extended=True,
+            ),
+            "2": UsageEntry(last_good=_usage(10), fetched_at=now, age_s=0),
+            "3": UsageEntry(last_good=_usage(20), fetched_at=now, age_s=0),
+        }
+        fetches = []
+
+        def collect(*, fetch=frozenset(), **_kwargs):
+            fetches.append(set(fetch))
+            return entries
+
+        harness.persist_usage_entries(entries)
+        with patch.object(
+            harness.switcher, "usage_entries_by_account", side_effect=collect
+        ):
+            outcomes = [harness.engine.tick() for _ in range(3)]
+
+        assert {"1", "2", "3"} in fetches
+        assert outcomes == [
+            TickOutcome.NO_ACTION,
+            TickOutcome.NO_ACTION,
+            TickOutcome.SWITCHED,
+        ]
+        assert harness.active_number() == 2
+
+    def test_long_429_remains_unavailable_near_deadline(self, harness):
+        now = harness.clock.now
+        entries = {
+            "1": UsageEntry(
+                last_good=_usage(44), fetched_at=now - 10, age_s=10,
+                last_attempt_at=now - 590, consecutive_failures=1,
+                last_error="http-429", backoff_until=now + 10,
+                trust_extended=True,
+            ),
+            "2": UsageEntry(last_good=_usage(10), fetched_at=now, age_s=0),
+            "3": UsageEntry(last_good=_usage(20), fetched_at=now, age_s=0),
+        }
+
+        assert harness.tick_with_entries(entries) is TickOutcome.NO_ACTION
+        assert harness.engine._unhealthy_ticks == 1
+        reason = next(e for e in harness.events if isinstance(e, NoSwitchEvent))
+        assert reason.reason == "active-usage-unknown"
+
+    def test_fresh_success_clears_active_unavailable_state(self, harness):
+        now = harness.clock.now
+        failed = {
+            "1": UsageEntry(
+                last_good=_usage(44), fetched_at=now, age_s=0,
+                last_attempt_at=now, consecutive_failures=1,
+                last_error="http-429", backoff_until=now + 600,
+                trust_extended=True,
+            ),
+            "2": UsageEntry(last_good=_usage(10), fetched_at=now, age_s=0),
+            "3": UsageEntry(last_good=_usage(20), fetched_at=now, age_s=0),
+        }
+        assert harness.tick_with_entries(failed) is TickOutcome.NO_ACTION
+        assert harness.engine._unhealthy_ticks == 1
+
+        recovered = dict(failed)
+        recovered["1"] = UsageEntry(
+            last_good=_usage(45), fetched_at=now, age_s=0
+        )
+        harness.events.clear()
+        assert harness.tick_with_entries(recovered) is TickOutcome.NO_ACTION
+        assert harness.engine._unhealthy_ticks == 0
+        assert next(
+            e.reason for e in harness.events if isinstance(e, NoSwitchEvent)
+        ) == "below-threshold"
+
+    def test_stale_at_limit_remains_conservative_switch_evidence(self, harness):
+        now = harness.clock.now
+        outcome = harness.tick_with_entries({
+            "1": UsageEntry(
+                last_good=_usage(100), fetched_at=now - 1000, age_s=1000,
+                consecutive_failures=1, last_error="http-429", trust_extended=True,
+            ),
+            "2": UsageEntry(last_good=_usage(10), fetched_at=now, age_s=0),
+            "3": UsageEntry(last_good=_usage(20), fetched_at=now, age_s=0),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert next(e for e in harness.events if isinstance(e, SwitchEvent)).trigger == "at-limit"
+
+    def test_fresh_candidate_wins_when_better_candidate_is_stale(self, harness):
+        now = harness.clock.now
+        outcome = harness.tick_with_entries({
+            "1": UsageEntry(last_good=_usage(95), fetched_at=now, age_s=0),
+            "2": UsageEntry(last_good=_usage(1), fetched_at=now - 181, age_s=181),
+            "3": UsageEntry(last_good=_usage(10), fetched_at=now, age_s=0),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 3
+
+    def test_all_stale_usable_candidates_block_explicitly(self, harness):
+        now = harness.clock.now
+        outcome = harness.tick_with_entries({
+            "1": UsageEntry(last_good=_usage(95), fetched_at=now, age_s=0),
+            "2": UsageEntry(last_good=_usage(1), fetched_at=now - 181, age_s=181),
+            "3": UsageEntry(last_good=_usage(10), fetched_at=now - 181, age_s=181),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        event = next(e for e in harness.events if isinstance(e, NoSwitchEvent))
+        assert event.reason == "no-fresh-candidate"
+        assert "fresh" in event.detail
+
+    def test_unhealthy_grace_resets_when_current_account_changes(self, harness):
+        now = harness.clock.now
+        entries = {
+            "1": UsageEntry(),
+            "2": UsageEntry(),
+            "3": UsageEntry(last_good=_usage(10), fetched_at=now, age_s=0),
+        }
+        assert harness.tick_with_entries(entries) is TickOutcome.NO_ACTION
+        assert harness.engine._unhealthy_ticks == 1
+
+        harness.make_live("b@example.com", 2)
+        assert harness.tick_with_entries(entries) is TickOutcome.NO_ACTION
+        assert harness.engine._unhealthy_ticks == 1
+
+    def test_failover_obeys_cooldown_but_known_at_limit_bypasses(self, temp_home):
+        h = EngineHarness(temp_home, unhealthy_ticks=1, cooldown_seconds=300)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        h.engine._mutate_state(lambda state: state.update(lastSwitchAt=h.clock.now))
+        now = h.clock.now
+        candidate = UsageEntry(last_good=_usage(10), fetched_at=now, age_s=0)
+
+        assert h.tick_with_entries({"1": UsageEntry(), "2": candidate}) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert next(e.reason for e in h.events if isinstance(e, NoSwitchEvent)) == "cooldown"
+
+        h.events.clear()
+        active_limit = UsageEntry(last_good=_usage(100), fetched_at=now, age_s=0)
+        assert h.tick_with_entries({"1": active_limit, "2": candidate}) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_under_lock_current_change_discards_decision(self, harness):
+        def change_current(_num, _email):
+            harness.make_live("c@example.com", 3)
+            return "ok"
+
+        with patch.object(
+            harness.engine, "_freshen_target", side_effect=change_current
+        ):
+            outcome = harness.tick_with_usage({
+                "1": _usage(95), "2": _usage(10), "3": _usage(20),
+            })
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert harness.switcher.current_account_number() == "3"
+        event = next(e for e in harness.events if isinstance(e, NoSwitchEvent))
+        assert event.reason == "active-account-changed"
+
+    def test_current_change_after_outer_check_is_rejected_inside_switch_lock(
+        self, harness
+    ):
+        entered = threading.Event()
+        release = threading.Event()
+        original = harness.switcher.switch_to
+        outcome = []
+        errors = []
+
+        def wait_before_switch(*args, **kwargs):
+            entered.set()
+            assert release.wait(timeout=5)
+            return original(*args, **kwargs)
+
+        def run_tick():
+            try:
+                outcome.append(harness.tick_with_usage({
+                    "1": _usage(95), "2": _usage(10), "3": _usage(20),
+                }))
+            except BaseException as exc:  # surface worker failures in the test
+                errors.append(exc)
+
+        with patch.object(
+            harness.switcher, "switch_to", side_effect=wait_before_switch
+        ):
+            worker = threading.Thread(target=run_tick)
+            worker.start()
+            assert entered.wait(timeout=5)
+            # A manual switch lands after the engine's outer state-lock check
+            # but before the switcher acquires its credential/config locks.
+            harness.make_live("c@example.com", 3)
+            manual_state = self._live_state(harness)
+            release.set()
+            worker.join(timeout=5)
+
+        assert not worker.is_alive()
+        assert not errors
+        assert outcome == [TickOutcome.NO_ACTION]
+        assert harness.switcher.current_account_number() == "3"
+        assert self._live_state(harness) == manual_state
+        assert not harness.state().get("lastSwitchAt")
+        event = next(e for e in harness.events if isinstance(e, NoSwitchEvent))
+        assert event.reason == "active-account-changed"
+
+    def test_logout_after_outer_check_is_rejected_inside_switch_lock(
+        self, harness
+    ):
+        entered = threading.Event()
+        release = threading.Event()
+        original = harness.switcher.switch_to
+        outcome = []
+
+        def wait_before_switch(*args, **kwargs):
+            entered.set()
+            assert release.wait(timeout=5)
+            return original(*args, **kwargs)
+
+        with patch.object(
+            harness.switcher, "switch_to", side_effect=wait_before_switch
+        ):
+            worker = threading.Thread(
+                target=lambda: outcome.append(harness.tick_with_usage({
+                    "1": _usage(95), "2": _usage(10), "3": _usage(20),
+                }))
+            )
+            worker.start()
+            assert entered.wait(timeout=5)
+            (harness.temp_home / ".claude" / ".credentials.json").unlink()
+            (harness.temp_home / ".claude.json").unlink()
+            logged_out_state = self._live_state(harness)
+            release.set()
+            worker.join(timeout=5)
+
+        assert not worker.is_alive()
+        assert outcome == [TickOutcome.NO_ACTION]
+        assert self._live_state(harness) == logged_out_state
+        assert not harness.state().get("lastSwitchAt")
+        event = next(e for e in harness.events if isinstance(e, NoSwitchEvent))
+        assert event.reason == "active-account-changed"
+
+    def test_direct_activation_branch_honors_final_guard(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        before = self._live_state(h)
+
+        result = h.switcher.switch_to(
+            "2",
+            json_output=True,
+            activation_guard=lambda _entries, _now, _target: "stale-usage",
+        )
+
+        assert result["switched"] is False
+        assert result["reason"] == "stale-usage"
+        assert self._live_state(h) == before
+
+    def test_consume_first_source_crossing_stale_ceiling_reenters_grace(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home, strategy="consume-first")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+        entries = {
+            "1": UsageEntry(
+                last_good=_usage7(20, 20, _R_LATEST),
+                fetched_at=now - 299,
+                age_s=299,
+            ),
+            "2": UsageEntry(
+                last_good=_usage7(10, 10, _R_SOON),
+                fetched_at=now,
+                age_s=0,
+            ),
+        }
+        h.persist_usage_entries(entries)
+        identities = {"1": ("a@example.com", ""), "2": ("b@example.com", "")}
+
+        def stored_view(**_kwargs):
+            return h.switcher._usage_store.entries(identities)
+
+        def slow_freshen(_num, _email):
+            h.clock.advance(2)
+            return "ok"
+
+        with patch.object(
+            h.switcher, "usage_entries_by_account", side_effect=stored_view
+        ), patch.object(h.engine, "_freshen_target", side_effect=slow_freshen):
+            outcome = h.engine.tick()
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert h.engine._unhealthy_ticks == 1
+        reason = next(e.reason for e in h.events if isinstance(e, NoSwitchEvent))
+        assert reason == "active-usage-unknown"
+
+    def test_target_429_committed_before_write_refuses_normal_activation(
+        self, harness
+    ):
+        original = harness.switcher.switch_to
+        before = self._live_state(harness)
+
+        def throttle_target(*args, **kwargs):
+            harness.switcher._usage_store.record(
+                {"2": FetchRecord(error="http-429", retry_after_s=600.0)},
+                {"2": ("b@example.com", "")},
+            )
+            return original(*args, **kwargs)
+
+        with patch.object(
+            harness.switcher, "switch_to", side_effect=throttle_target
+        ):
+            outcome = harness.tick_with_usage({
+                "1": _usage(95), "2": _usage(10), "3": _usage(20),
+            })
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert harness.active_number() == 1
+        assert self._live_state(harness) == before
+        event = next(e for e in harness.events if isinstance(e, NoSwitchEvent))
+        assert event.reason == "stale-usage"
+
+    @pytest.mark.parametrize("mutation", ["disable", "kind"])
+    def test_target_roster_change_before_write_refuses_activation(
+        self, harness, mutation
+    ):
+        original = harness.switcher.switch_to
+        before_live = self._live_state(harness)[:2]
+
+        def mutate_target(*args, **kwargs):
+            if mutation == "disable":
+                harness.switcher.set_account_disabled("2", True)
+            else:
+                with FileLock(harness.switcher.lock_file):
+                    data = harness.switcher._get_sequence_data()
+                    data["accounts"]["2"]["kind"] = "api_key"
+                    harness.switcher._write_json(harness.switcher.sequence_file, data)
+            return original(*args, **kwargs)
+
+        with patch.object(
+            harness.switcher, "switch_to", side_effect=mutate_target
+        ):
+            outcome = harness.tick_with_usage({
+                "1": _usage(95), "2": _usage(10), "3": _usage(20),
+            })
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert harness.active_number() == 1
+        assert self._live_state(harness)[:2] == before_live
+        event = next(e for e in harness.events if isinstance(e, NoSwitchEvent))
+        assert event.reason == "target-no-longer-eligible"
+
+    def test_target_invalid_grant_before_write_refuses_bound_credential(
+        self, harness
+    ):
+        original = harness.switcher.switch_to
+        before = self._live_state(harness)
+        target_creds = harness.switcher._read_account_credentials(
+            "2", "b@example.com"
+        )
+
+        def reject_target(*args, **kwargs):
+            harness.switcher._usage_store.record(
+                {
+                    "2": FetchRecord(
+                        error="invalid_grant",
+                        struck_fp=oauth.credential_fingerprint(target_creds),
+                    )
+                },
+                {"2": ("b@example.com", "")},
+            )
+            return original(*args, **kwargs)
+
+        with patch.object(
+            harness.switcher, "switch_to", side_effect=reject_target
+        ):
+            outcome = harness.tick_with_usage({
+                "1": _usage(95), "2": _usage(10), "3": _usage(20),
+            })
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert harness.active_number() == 1
+        assert self._live_state(harness) == before
+        event = next(e for e in harness.events if isinstance(e, NoSwitchEvent))
+        assert event.reason == "target-auth-dead"
+
+    def test_usage_record_waits_until_guarded_credential_write_finishes(
+        self, harness
+    ):
+        write_entered = threading.Event()
+        release_write = threading.Event()
+        record_started = threading.Event()
+        record_done = threading.Event()
+        replan_done = threading.Event()
+        outcomes = []
+        errors = []
+        original_write = harness.switcher._write_credentials
+        original_replan = harness.switcher._replan_new_active
+
+        def blocked_write(credentials):
+            write_entered.set()
+            assert release_write.wait(timeout=5)
+            return original_write(credentials)
+
+        def tracked_replan(*args, **kwargs):
+            result = original_replan(*args, **kwargs)
+            replan_done.set()
+            return result
+
+        def run_tick():
+            try:
+                outcomes.append(harness.tick_with_usage({
+                    "1": _usage(95), "2": _usage(10), "3": _usage(20),
+                }))
+            except BaseException as exc:
+                errors.append(exc)
+
+        def record_usage():
+            try:
+                record_started.set()
+                harness.switcher._usage_store.record(
+                    {"2": FetchRecord(usage=_usage(11))},
+                    {"2": ("b@example.com", "")},
+                )
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                record_done.set()
+
+        with patch.object(
+            harness.switcher, "_write_credentials", side_effect=blocked_write
+        ), patch.object(
+            harness.switcher, "_replan_new_active", side_effect=tracked_replan
+        ):
+            switch_worker = threading.Thread(target=run_tick)
+            switch_worker.start()
+            assert write_entered.wait(timeout=5)
+            record_worker = threading.Thread(target=record_usage)
+            record_worker.start()
+            assert record_started.wait(timeout=5)
+            assert not record_done.wait(timeout=0.2)
+            release_write.set()
+            switch_worker.join(timeout=5)
+            record_worker.join(timeout=5)
+
+        assert not switch_worker.is_alive()
+        assert not record_worker.is_alive()
+        assert not errors
+        assert outcomes == [TickOutcome.SWITCHED]
+        assert record_done.is_set()
+        assert replan_done.is_set()
+        assert harness.active_number() == 2
+
+    def test_target_usage_change_before_write_invalidates_original_ranking(
+        self, harness
+    ):
+        original = harness.switcher.switch_to
+        before = self._live_state(harness)
+
+        def burn_target(*args, **kwargs):
+            harness.switcher._usage_store.record(
+                {"2": FetchRecord(usage=_usage(90))},
+                {"2": ("b@example.com", "")},
+            )
+            return original(*args, **kwargs)
+
+        with patch.object(
+            harness.switcher, "switch_to", side_effect=burn_target
+        ):
+            outcome = harness.tick_with_usage({
+                "1": _usage(95), "2": _usage(10), "3": _usage(20),
+            })
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert harness.active_number() == 1
+        assert self._live_state(harness) == before
+        event = next(e for e in harness.events if isinstance(e, NoSwitchEvent))
+        assert event.reason == "target-no-longer-eligible"
+
+    def test_source_recovery_before_write_cancels_failover(self, temp_home):
+        h = EngineHarness(temp_home, unhealthy_ticks=1)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        original = h.switcher.switch_to
+        before = self._live_state(h)
+
+        def recover_source(*args, **kwargs):
+            h.switcher._usage_store.record(
+                {"1": FetchRecord(usage=_usage(10))},
+                {"1": ("a@example.com", "")},
+            )
+            return original(*args, **kwargs)
+
+        with patch.object(h.switcher, "switch_to", side_effect=recover_source):
+            outcome = h.tick_with_entries({
+                "1": UsageEntry(),
+                "2": UsageEntry(
+                    last_good=_usage(10), fetched_at=h.clock.now, age_s=0
+                ),
+            })
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert self._live_state(h) == before
+        event = next(e for e in h.events if isinstance(e, NoSwitchEvent))
+        assert event.reason == "active-usage-recovered"
+
+    def test_under_lock_target_quarantine_blocks_activation(self, harness):
+        def quarantine_target(num, _email):
+            harness.engine._mutate_state(
+                lambda state: state.setdefault("quarantine", {}).update(
+                    {num: {"reason": "concurrent-test"}}
+                )
+            )
+            return "ok"
+
+        with patch.object(
+            harness.engine, "_freshen_target", side_effect=quarantine_target
+        ):
+            outcome = harness.tick_with_usage({
+                "1": _usage(95), "2": _usage(10), "3": _usage(20),
+            })
+
+        assert outcome is TickOutcome.BLOCKED
+        assert harness.active_number() == 1
+        event = next(e for e in harness.events if isinstance(e, NoSwitchEvent))
+        assert event.reason == "target-quarantined"

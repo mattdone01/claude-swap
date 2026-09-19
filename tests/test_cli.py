@@ -1091,9 +1091,9 @@ class TestAutoCommand:
             "schemaVersion": 1,
             "autoswitch": {"threshold": 80.0, "cooldownSeconds": 42.0},
         }))
-        self._run(["--once", "--threshold", "60"], temp_home)
+        self._run(["--once", "--threshold", "35"], temp_home)
         engine = self.FakeEngine.instances[-1]
-        assert engine.settings.threshold == 60.0     # CLI wins
+        assert engine.settings.threshold == 35.0     # CLI wins without clamping
         assert engine.settings.cooldown_seconds == 42.0  # settings.json kept
 
     def test_dry_run_forwarded(self, temp_home):
@@ -1134,6 +1134,7 @@ class TestAutoCommand:
         assert excinfo.value.code == 0
         out = capsys.readouterr().out
         assert "--once" in out
+        assert "1-99.9; default 90" in out
         assert "Exit codes" in out
 
     def test_main_help_mentions_auto(self):
