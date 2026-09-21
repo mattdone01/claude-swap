@@ -20,7 +20,8 @@ activation the target's token is *freshened* (refreshed if it expires within
 under-lock re-read sees a fresh token and aborts its own refresh); a target
 whose refresh token is dead gets quarantined instead of activated. When the
 active account's own usage becomes unreadable for ``unhealthy_ticks``
-consecutive ticks, the engine fails over to any healthy candidate.
+consecutive ticks, the engine fails over only to a fresh candidate with a
+full hysteresis margin of measured runway.
 
 Cooldown and quarantine persist in ``<backup_root>/autoswitch_state.json``
 (so cron-driven ``cswap auto --once`` ticks behave across processes), mutated
@@ -714,6 +715,55 @@ def _candidate_can_rank(entry, now: float, models: tuple[str, ...]) -> bool:
     return _candidate_is_fresh(entry, now)
 
 
+def _safe_failover_target(
+    usage: dict | str | None,
+    threshold: float,
+    hysteresis_pct: float,
+    models: tuple[str, ...],
+) -> bool:
+    """Whether measured usage leaves enough runway for a failover landing.
+
+    Failover starts from an unreadable source, so it cannot make a relative
+    comparison with that account. Use the configured landing policy as an
+    absolute safety floor instead: every relevant utilization window must be
+    known and finite before taking their binding maximum. That maximum must
+    be strictly below the trigger threshold and no higher than the threshold
+    minus hysteresis. The floor at zero keeps low thresholds meaningful
+    without manufacturing negative utilization requirements.
+    """
+    value = usage if isinstance(usage, dict) else None
+    windows = oauth.relevant_windows(value, models)
+    if not windows or any(not math.isfinite(pct) for _, pct, _ in windows):
+        return False
+    pct = max(window_pct for _, window_pct, _ in windows)
+    safe_ceiling = max(0.0, threshold - hysteresis_pct)
+    return bool(
+        pct < threshold
+        and pct <= safe_ceiling
+    )
+
+
+def _safe_failover_detail(threshold: float, hysteresis_pct: float) -> str:
+    """User-facing explanation of the failover landing requirement."""
+    safe_ceiling = max(0.0, threshold - hysteresis_pct)
+    return (
+        "failover requires fresh, known finite target utilization "
+        f"< {pct_label(threshold)}% and <= {pct_label(safe_ceiling)}% "
+        f"(at least {pct_label(100.0 - safe_ceiling)}% measured headroom); "
+        "candidate telemetry is unknown or has insufficient runway"
+    )
+
+
+def _no_safe_failover_event(
+    threshold: float, hysteresis_pct: float
+) -> NoSwitchEvent:
+    """Build the single blocked-failover event used at every decision edge."""
+    return NoSwitchEvent(
+        reason="no-safe-failover-target",
+        detail=_safe_failover_detail(threshold, hysteresis_pct),
+    )
+
+
 def _activation_refusal(
     entries: dict,
     now: float,
@@ -721,6 +771,7 @@ def _activation_refusal(
     target: str,
     trigger: str,
     threshold: float,
+    hysteresis_pct: float,
     models: tuple[str, ...],
     *,
     require_fresh_target: bool = True,
@@ -741,6 +792,15 @@ def _activation_refusal(
         return "below-threshold"
     if require_fresh_target and not _candidate_is_fresh(entries.get(target), now):
         return "stale-usage"
+    if trigger == "failover" and require_fresh_target:
+        target_entry = entries.get(target)
+        target_value = (
+            target_entry.decision_value() if target_entry is not None else None
+        )
+        if not _safe_failover_target(
+            target_value, threshold, hysteresis_pct, models
+        ):
+            return "no-safe-failover-target"
     return None
 
 
@@ -1233,6 +1293,13 @@ class AutoSwitchEngine:
             )
             return TickOutcome.NO_ACTION
         if not oauth_candidates and not api_key_candidates:
+            if trigger == "failover":
+                self._emit(
+                    _no_safe_failover_event(
+                        settings.threshold, settings.hysteresis_pct
+                    )
+                )
+                return TickOutcome.BLOCKED
             if all_oauth_candidates:
                 self._emit(
                     NoSwitchEvent(
@@ -1377,6 +1444,16 @@ class AutoSwitchEngine:
             using_api_key_fallback = True
 
         if not ordered:
+            if trigger == "failover":
+                # Unknown source telemetry is not exhaustion. Hold at normal
+                # cadence until an OAuth peer has measured runway or an
+                # explicitly opted-in API-key fallback is available.
+                self._emit(
+                    _no_safe_failover_event(
+                        settings.threshold, settings.hysteresis_pct
+                    )
+                )
+                return TickOutcome.BLOCKED
             if not any_known:
                 # No candidate readable this tick — true for every strategy,
                 # and must not be dressed up as a consume-first hold.
@@ -1464,6 +1541,7 @@ class AutoSwitchEngine:
         )
         transient_failure = False
         systemic = ""
+        unsafe_failover_target = False
         for num in ordered:
             expected_identity = self.switcher.account_identity(num)
             email = expected_identity["email"]
@@ -1557,6 +1635,7 @@ class AutoSwitchEngine:
                     num,
                     trigger,
                     settings.threshold,
+                    settings.hysteresis_pct,
                     self._models,
                     require_fresh_target=expected_target[2] != "api_key",
                 )
@@ -1634,9 +1713,15 @@ class AutoSwitchEngine:
             final_entries = self.switcher.usage_entries_by_account(fetch=set())
             final_now = self.clock()
             refusal = final_refusal(final_entries, final_now)
-            if refusal in {"stale-usage", "target-no-longer-eligible"} and (
-                trigger != "consume-first"
-            ):
+            if refusal in {
+                "stale-usage",
+                "target-no-longer-eligible",
+                "no-safe-failover-target",
+            } and trigger != "consume-first":
+                unsafe_failover_target = (
+                    unsafe_failover_target
+                    or refusal == "no-safe-failover-target"
+                )
                 continue
             if refusal is not None:
                 return self._hold_activation_refusal(refusal, num)
@@ -1671,6 +1756,13 @@ class AutoSwitchEngine:
                 )
             )
             return TickOutcome.ERROR
+        if unsafe_failover_target:
+            self._emit(
+                _no_safe_failover_event(
+                    settings.threshold, settings.hysteresis_pct
+                )
+            )
+            return TickOutcome.BLOCKED
         self._emit(NoSwitchEvent(reason="no-viable-target"))
         return TickOutcome.BLOCKED
 
@@ -2126,6 +2218,13 @@ class AutoSwitchEngine:
             any_known = True          # it EXISTS and is readable either way
             if h <= 0:
                 continue  # itself at its limit — never a target
+            if trigger == "failover" and not _safe_failover_target(
+                usage.get(num),
+                settings.threshold,
+                settings.hysteresis_pct,
+                self._models,
+            ):
+                continue
             if num == no_return:
                 continue  # the account we just left; see _no_return_account
             reset_ts = (
@@ -2138,9 +2237,10 @@ class AutoSwitchEngine:
             )
             if trigger in ("proactive", "consume-first"):
                 # Landing must be healthy: an account at/over the threshold
-                # would re-trigger on the very next tick. At-limit and failover
-                # are escapes that skip this whole block — any account with real
-                # headroom beats a blocked or dead one.
+                # would re-trigger on the very next tick. At-limit skips this
+                # whole block because any positive headroom beats a measured
+                # hard limit. Failover also skips the relative comparisons in
+                # this block, but its absolute runway gate ran above.
                 if (100.0 - h) >= settings.threshold and not all_above:
                     continue
                 if all_above:
@@ -2399,6 +2499,13 @@ class AutoSwitchEngine:
         self, reason: str, target: str
     ) -> TickOutcome:
         """Report a final-boundary refusal without mutating switch state."""
+        if reason == "no-safe-failover-target":
+            self._emit(
+                _no_safe_failover_event(
+                    self.settings.threshold, self.settings.hysteresis_pct
+                )
+            )
+            return TickOutcome.BLOCKED
         if reason == "active-usage-unknown":
             self._idle_hold_since = None
             self._unhealthy_ticks += 1
@@ -2505,6 +2612,7 @@ class AutoSwitchEngine:
                     "stale-usage",
                     "target-no-longer-eligible",
                     "target-auth-dead",
+                    "no-safe-failover-target",
                 }:
                     return self._hold_activation_refusal(reason, number)
                 self._emit(

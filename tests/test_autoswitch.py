@@ -597,10 +597,20 @@ class TestDecisionTable:
         assert outcome is TickOutcome.BLOCKED
         assert harness.active_number() == 1
 
-    def test_failover_ignores_hysteresis_bar(self, harness):
-        # Active usage unreadable (auth likely dead); the only candidate with
-        # room sits above the hysteresis bar — failover takes it anyway.
-        usage = {"1": None, "2": _usage(85), "3": _usage(100)}
+    def test_known_at_limit_can_still_escape_to_99_percent(self, harness):
+        outcome = harness.tick_with_usage({
+            "1": _usage(100), "2": _usage(99), "3": _usage(100),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 2
+        switch = next(e for e in harness.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "at-limit"
+
+    def test_failover_lands_on_safe_hysteresis_boundary(self, harness):
+        # Active usage unreadable (auth likely dead); failover may land only
+        # where the normal threshold and hysteresis leave safe runway. At the
+        # defaults (90/10), exactly 80% used is the inclusive boundary.
+        usage = {"1": None, "2": _usage(80), "3": _usage(100)}
         harness.tick_with_usage(usage)
         harness.tick_with_usage(usage)
         outcome = harness.tick_with_usage(usage)
@@ -1820,6 +1830,25 @@ class TestApiKeyAccounts:
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
+
+    def test_opted_in_api_key_remains_a_failover_fallback(self, temp_home):
+        h = EngineHarness(
+            temp_home, include_api_key_accounts=True, unhealthy_ticks=1
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        self._mark_api_key(h, 2)
+
+        outcome = h.tick_with_usage({
+            "1": None, "2": "api key", "3": _usage(99),
+        })
+
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "failover"
 
     def test_ranked_oauth_replaced_by_api_key_does_not_gain_opt_in(
         self, temp_home
@@ -7105,6 +7134,210 @@ class TestTelemetrySafety:
         reason = next(e for e in harness.events if isinstance(e, NoSwitchEvent))
         assert reason.reason == "active-usage-unknown"
 
+    def test_long_429_holds_when_every_peer_lacks_safe_runway(self, temp_home):
+        h = EngineHarness(
+            temp_home,
+            threshold=97.0,
+            hysteresis_pct=10.0,
+            model="Fable",
+        )
+        for num, email in enumerate(
+            [
+                "chloe@example.com",
+                "billy@example.com",
+                "dick@example.com",
+                "four@example.com",
+                "five@example.com",
+            ],
+            start=1,
+        ):
+            h.seed(num, email)
+        h.make_live("chloe@example.com", 1)
+        now = h.clock.now
+
+        def usage(pct):
+            return {
+                "five_hour": {"pct": pct},
+                "seven_day": {"pct": pct},
+                "scoped": [{"name": "Fable", "pct": pct}],
+            }
+
+        entries = {
+            "1": UsageEntry(
+                last_good={
+                    "five_hour": {"pct": 29.0},
+                    "seven_day": {"pct": 30.0},
+                    "scoped": [{"name": "Fable", "pct": 30.0}],
+                },
+                fetched_at=now,
+                age_s=0.0,
+                last_attempt_at=now,
+                consecutive_failures=1,
+                last_error="http-429",
+                backoff_until=now + 4350.0,
+                trust_extended=True,
+            ),
+            **{
+                str(num): UsageEntry(
+                    last_good=usage(pct), fetched_at=now, age_s=0.0
+                )
+                for num, pct in enumerate((92.0, 95.0, 97.0, 99.0), start=2)
+            },
+        }
+
+        outcomes = [h.tick_with_entries(entries) for _ in range(3)]
+
+        assert outcomes == [
+            TickOutcome.NO_ACTION,
+            TickOutcome.NO_ACTION,
+            TickOutcome.BLOCKED,
+        ]
+        assert h.active_number() == 1
+        event = [e for e in h.events if isinstance(e, NoSwitchEvent)][-1]
+        assert event.reason == "no-safe-failover-target"
+        assert "<= 87%" in event.detail
+        assert "13%" in event.detail
+        assert "unknown" in event.detail
+        assert not any(isinstance(e, AllExhaustedEvent) for e in h.events)
+        assert h.engine._sleep_until_ts is None
+        assert h.engine._next_delay(outcomes[-1]) <= (
+            1.1 * h.settings.interval_seconds
+        )
+
+    @pytest.mark.parametrize(
+        ("threshold", "hysteresis", "target_pct", "switches"),
+        [
+            (97.0, 10.0, 87.0, True),
+            (97.0, 10.0, 87.000001, False),
+            (97.0, 0.0, 96.999999, True),
+            (97.0, 0.0, 97.0, False),
+            (35.0, 10.0, 25.0, True),
+            (35.0, 10.0, 25.000001, False),
+            (5.0, 10.0, 0.0, True),
+            (5.0, 10.0, 0.000001, False),
+            (97.0, 10.0, float("nan"), False),
+            (97.0, 10.0, float("inf"), False),
+        ],
+    )
+    def test_failover_safe_landing_boundaries(
+        self, temp_home, threshold, hysteresis, target_pct, switches
+    ):
+        h = EngineHarness(
+            temp_home,
+            threshold=threshold,
+            hysteresis_pct=hysteresis,
+            unhealthy_ticks=1,
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        outcome = h.tick_with_usage({"1": None, "2": _usage(target_pct)})
+
+        assert (outcome is TickOutcome.SWITCHED) is switches
+        assert h.active_number() == (2 if switches else 1)
+        if not switches:
+            event = next(e for e in h.events if isinstance(e, NoSwitchEvent))
+            assert event.reason == "no-safe-failover-target"
+
+    def test_failover_with_unknown_target_uses_safe_target_reason(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home, unhealthy_ticks=1)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        outcome = h.tick_with_entries({"1": UsageEntry(), "2": UsageEntry()})
+
+        assert outcome is TickOutcome.BLOCKED
+        event = next(e for e in h.events if isinstance(e, NoSwitchEvent))
+        assert event.reason == "no-safe-failover-target"
+        assert "unknown" in event.detail
+
+    @pytest.mark.parametrize(
+        ("model", "target", "switches"),
+        [
+            (
+                "",
+                {
+                    "five_hour": {"pct": 10.0},
+                    "seven_day": {"pct": float("nan")},
+                },
+                False,
+            ),
+            (
+                "Fable",
+                {
+                    "five_hour": {"pct": 10.0},
+                    "seven_day": {"pct": 20.0},
+                    "scoped": [{"name": "Fable", "pct": float("nan")}],
+                },
+                False,
+            ),
+            (
+                "Opus",
+                {
+                    "five_hour": {"pct": 10.0},
+                    "seven_day": {"pct": 20.0},
+                    "scoped": [
+                        {"name": "Fable", "pct": float("nan")},
+                        {"name": "Opus", "pct": 30.0},
+                    ],
+                },
+                True,
+            ),
+        ],
+    )
+    def test_failover_requires_each_selected_window_to_be_finite(
+        self, temp_home, model, target, switches
+    ):
+        h = EngineHarness(
+            temp_home,
+            threshold=97.0,
+            hysteresis_pct=10.0,
+            unhealthy_ticks=1,
+            model=model,
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        outcome = h.tick_with_usage({"1": None, "2": target})
+
+        assert (outcome is TickOutcome.SWITCHED) is switches
+        assert h.active_number() == (2 if switches else 1)
+        if not switches:
+            event = next(e for e in h.events if isinstance(e, NoSwitchEvent))
+            assert event.reason == "no-safe-failover-target"
+
+    def test_failover_uses_maximum_configured_scoped_limit(self, temp_home):
+        h = EngineHarness(
+            temp_home,
+            threshold=97.0,
+            hysteresis_pct=10.0,
+            unhealthy_ticks=1,
+            model="Fable,Opus",
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        target = {
+            "five_hour": {"pct": 10.0},
+            "seven_day": {"pct": 20.0},
+            "scoped": [
+                {"name": "Opus", "pct": 30.0},
+                {"name": "Fable", "pct": 99.0},
+            ],
+        }
+
+        outcome = h.tick_with_usage({"1": None, "2": target})
+
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        event = next(e for e in h.events if isinstance(e, NoSwitchEvent))
+        assert event.reason == "no-safe-failover-target"
+
     def test_fresh_success_clears_active_unavailable_state(self, harness):
         now = harness.clock.now
         failed = {
@@ -7534,6 +7767,60 @@ class TestTelemetrySafety:
         assert self._live_state(harness) == before
         event = next(e for e in harness.events if isinstance(e, NoSwitchEvent))
         assert event.reason == "target-no-longer-eligible"
+
+    @pytest.mark.parametrize(
+        ("model", "changed_usage"),
+        [
+            ("", _usage(90.0)),
+            (
+                "",
+                {
+                    "five_hour": {"pct": 10.0},
+                    "seven_day": {"pct": float("nan")},
+                },
+            ),
+            (
+                "Fable",
+                {
+                    "five_hour": {"pct": 10.0},
+                    "seven_day": {"pct": 20.0},
+                    "scoped": [{"name": "Fable", "pct": float("nan")}],
+                },
+            ),
+        ],
+    )
+    def test_failover_target_becoming_unsafe_before_write_is_refused(
+        self, temp_home, model, changed_usage
+    ):
+        h = EngineHarness(
+            temp_home,
+            threshold=97.0,
+            hysteresis_pct=10.0,
+            unhealthy_ticks=1,
+            model=model,
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        original = h.switcher.switch_to
+        before = self._live_state(h)
+
+        def burn_target(*args, **kwargs):
+            h.switcher._usage_store.record(
+                {"2": FetchRecord(usage=changed_usage)},
+                {"2": ("b@example.com", "")},
+            )
+            return original(*args, **kwargs)
+
+        with patch.object(h.switcher, "switch_to", side_effect=burn_target):
+            outcome = h.tick_with_usage({"1": None, "2": _usage(85)})
+
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert self._live_state(h) == before
+        assert not h.state().get("lastSwitchAt")
+        event = next(e for e in h.events if isinstance(e, NoSwitchEvent))
+        assert event.reason == "no-safe-failover-target"
 
     def test_source_recovery_before_write_cancels_failover(self, temp_home):
         h = EngineHarness(temp_home, unhealthy_ticks=1)
