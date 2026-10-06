@@ -120,6 +120,50 @@ class TestUrgentMode:
         )
         assert interval == poll_policy.MIN_INTERVAL_S
 
+    def test_window_specific_boundary_drives_urgent_mode(self):
+        thresholds = poll_policy.WindowThresholds(94.0, 98.0)
+        previous = {
+            "five_hour": {"pct": 70.0},
+            "seven_day": {"pct": 95.0},
+        }
+        current = {
+            "five_hour": {"pct": 70.0},
+            "seven_day": {"pct": 97.0},
+        }
+        _, interval = _plan(
+            prev_interval_s=poll_policy.MIN_INTERVAL_S,
+            prev_usage=previous,
+            new_usage=current,
+            is_active=True,
+            thresholds=thresholds,
+        )
+        assert interval == poll_policy.URGENT_INTERVAL_S
+
+
+class TestWindowThresholds:
+    def test_five_hour_and_weekly_boundaries_are_independent(self):
+        thresholds = poll_policy.WindowThresholds(94.0, 98.0)
+        assert poll_policy.threshold_runway(
+            {"five_hour": {"pct": 94.0}, "seven_day": {"pct": 20.0}},
+            thresholds,
+        ) == 0.0
+        assert poll_policy.threshold_runway(
+            {"five_hour": {"pct": 20.0}, "seven_day": {"pct": 98.0}},
+            thresholds,
+        ) == 0.0
+
+    def test_selected_scoped_window_uses_weekly_threshold(self):
+        usage = {
+            "five_hour": {"pct": 20.0},
+            "seven_day": {"pct": 30.0},
+            "scoped": [{"name": "Fable", "pct": 97.0}],
+        }
+        thresholds = poll_policy.WindowThresholds(94.0, 98.0)
+        assert poll_policy.threshold_runway(
+            usage, thresholds, ("Fable",)
+        ) == 1.0
+        assert poll_policy.threshold_runway(usage, thresholds) == 68.0
+
 
 class TestPost429Floor:
     def test_recent_429_floors_the_cadence(self):

@@ -13,6 +13,7 @@ import sys
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 
 from claude_swap import macos_keychain
@@ -87,7 +88,10 @@ from claude_swap.process_detection import get_running_instances
 from claude_swap import poll_policy
 from claude_swap.settings import load_settings, parse_model_names, settings_path
 from claude_swap.usage_store import (
+    AUTH_DEAD_STRIKES,
     FetchRecord,
+    RecordCommit,
+    ReservationRejection,
     UsageEntry,
     UsageStore,
     with_sentinel,
@@ -118,6 +122,43 @@ _FETCH_STAGGER_S = 0.25
 # serve TTL the data is current by design (that is the polling cadence), so
 # an age note there would be permanent noise.
 _USAGE_AGE_NOTE_S = poll_policy.SERVE_TTL_S
+# A fetch can spend up to 9s waiting on credential locks, 10s refreshing,
+# then 5s on each usage request (including the 401 retry path). Eight claimed
+# rows run concurrently with at most 1.75s launch stagger, keeping the bounded
+# batch comfortably inside the store's 90s claim lease.
+_MANUAL_REFRESH_CHUNK_SIZE = 8
+
+
+@dataclasses.dataclass
+class _UsageCollectionTrace:
+    """Facts from one collection pass needed by the manual refresh report."""
+
+    claims: dict[str, str] = dataclasses.field(default_factory=dict)
+    records: dict[str, FetchRecord] = dataclasses.field(default_factory=dict)
+    accepted: set[str] = dataclasses.field(default_factory=set)
+    commits: dict[str, RecordCommit] = dataclasses.field(default_factory=dict)
+    rejections: dict[str, ReservationRejection] = dataclasses.field(
+        default_factory=dict
+    )
+    static_sentinels: dict[str, str] = dataclasses.field(default_factory=dict)
+
+    def merge(self, other: _UsageCollectionTrace) -> None:
+        self.claims.update(other.claims)
+        self.records.update(other.records)
+        self.accepted.update(other.accepted)
+        self.commits.update(other.commits)
+        self.rejections.update(other.rejections)
+        self.static_sentinels.update(other.static_sentinels)
+
+
+def _utc_timestamp(value: float | None) -> str | None:
+    if value is None:
+        return None
+    return (
+        datetime.fromtimestamp(value, tz=timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
 
 
 def _pace_marker(window: dict, fetched_at: float | None) -> str:
@@ -334,9 +375,15 @@ class ClaudeAccountSwitcher:
         self.lock_file = self.backup_dir / ".lock"
         self._logger = setup_logging(self.backup_dir, debug=debug)
         self._usage_store = UsageStore(self.backup_dir / "cache")
-        # (settings mtime, (threshold, models)) — see _poll_policy_inputs.
-        self._poll_inputs_cache: tuple[float | None, tuple[float, tuple[str, ...]]] | None = None
-        self._poll_inputs_override: tuple[float, tuple[str, ...]] | None = None
+        # (settings mtime, (window thresholds, models)) — see
+        # _poll_policy_inputs.
+        self._poll_inputs_cache: tuple[
+            float | None,
+            tuple[poll_policy.WindowThresholds, tuple[str, ...]],
+        ] | None = None
+        self._poll_inputs_override: tuple[
+            poll_policy.WindowThresholds, tuple[str, ...]
+        ] | None = None
 
         # The credential storage layer (active + per-account backup stores, macOS
         # Keychain-vs-file routing, the per-process capability cache). Reads its
@@ -1737,6 +1784,200 @@ class ClaudeAccountSwitcher:
             accounts_info, fetch=fetch, scheduled=scheduled
         )
 
+    def refresh_usage(self) -> dict:
+        """Request a fresh usage measurement for every managed account.
+
+        This is an operator-triggered collection pass: successful-cache TTLs
+        and future poll plans do not suppress a request, but provider backoff,
+        dead-token quarantine, and another collector's atomic claim still do.
+        The returned rows describe this pass only; they never label a cached
+        last-good measurement as freshly refreshed.
+        """
+        accounts_info = self._build_accounts_info()
+        trace = _UsageCollectionTrace()
+        entries: dict[str, UsageEntry] = {}
+        for offset in range(0, len(accounts_info), _MANUAL_REFRESH_CHUNK_SIZE):
+            chunk = accounts_info[offset : offset + _MANUAL_REFRESH_CHUNK_SIZE]
+            chunk_trace = _UsageCollectionTrace()
+            entries.update(
+                self._collect_usage_entries(
+                    chunk,
+                    manual_refresh=True,
+                    trace=chunk_trace,
+                )
+            )
+            trace.merge(chunk_trace)
+        now = self._usage_store.clock()
+        active_number: int | None = None
+        results: list[dict] = []
+
+        for (
+            num,
+            email,
+            _org_name,
+            _org_uuid,
+            is_active,
+            _creds,
+            _alias,
+        ) in accounts_info:
+            number = str(num)
+            if is_active:
+                active_number = num
+            row = self._manual_refresh_result(
+                num,
+                email,
+                is_active,
+                entries[number],
+                trace,
+                now,
+            )
+            results.append(row)
+
+        return {
+            "schemaVersion": SCHEMA_VERSION,
+            "activeAccountNumber": active_number,
+            "accounts": results,
+        }
+
+    @staticmethod
+    def _manual_refresh_result(
+        num: int,
+        email: str,
+        is_active: bool,
+        entry: UsageEntry,
+        trace: _UsageCollectionTrace,
+        now: float,
+    ) -> dict:
+        """Build one attempt-scoped row, with cached data clearly labelled."""
+        number = str(num)
+        record = trace.records.get(number)
+        commit = trace.commits.get(number)
+        row: dict = {"number": num, "email": email, "active": is_active}
+
+        if number in trace.accepted and record is not None and commit is not None:
+            if commit.auth_dead_strikes >= AUTH_DEAD_STRIKES:
+                row.update(
+                    refreshStatus="unavailable",
+                    reason="relogin_required",
+                    detail=SENTINEL_NOTES[USAGE_RELOGIN_REQUIRED],
+                )
+            elif record.sentinel is not None:
+                reason, _usage = usage_fields(record.sentinel)
+                row.update(
+                    refreshStatus="unavailable",
+                    reason=reason,
+                    detail=SENTINEL_NOTES.get(record.sentinel, record.sentinel),
+                )
+            elif record.error is not None:
+                row.update(
+                    refreshStatus="error",
+                    reason=record.error,
+                    detail=ERROR_NOTES.get(record.error, record.error),
+                )
+                retry_at = _utc_timestamp(commit.backoff_until)
+                if retry_at is not None:
+                    row["retryAt"] = retry_at
+            else:
+                usage_status, usage = usage_fields(record.usage, commit.fetched_at)
+                row.update(
+                    refreshStatus="refreshed",
+                    reason=(
+                        "fresh_usage"
+                        if usage_status == "ok"
+                        else "no_usage_windows"
+                    ),
+                    refreshedAt=_utc_timestamp(commit.fetched_at),
+                    usageStatus=usage_status,
+                    usage=usage,
+                )
+        else:
+            static_sentinel = trace.static_sentinels.get(number)
+            if static_sentinel is not None:
+                reason, _usage = usage_fields(static_sentinel)
+                row.update(
+                    refreshStatus="unavailable",
+                    reason=reason,
+                    detail=SENTINEL_NOTES.get(static_sentinel, static_sentinel),
+                )
+            elif number in trace.claims:
+                row.update(
+                    refreshStatus="superseded",
+                    reason="claim_superseded",
+                    detail="a newer collector superseded this refresh result",
+                )
+                winner_retry_at = _utc_timestamp(entry.backoff_until)
+                if winner_retry_at is not None:
+                    row["retryAt"] = winner_retry_at
+            elif (rejection := trace.rejections.get(number)) is not None:
+                if rejection.reason == "quarantine":
+                    row.update(
+                        refreshStatus="unavailable",
+                        reason="relogin_required",
+                        detail=SENTINEL_NOTES[USAGE_RELOGIN_REQUIRED],
+                    )
+                elif rejection.reason == "backoff":
+                    row.update(
+                        refreshStatus="deferred",
+                        reason="backoff",
+                        detail=ERROR_NOTES.get(
+                            entry.last_error or "",
+                            entry.last_error or "provider backoff",
+                        ),
+                        retryAt=_utc_timestamp(rejection.backoff_until),
+                    )
+                else:
+                    row.update(
+                        refreshStatus="in_flight",
+                        reason="claim_active",
+                        detail="another usage request is already in flight",
+                        claimUntil=_utc_timestamp(rejection.claim_until),
+                    )
+            elif entry.claimed(now):
+                row.update(
+                    refreshStatus="in_flight",
+                    reason="claim_active",
+                    detail="another usage request is already in flight",
+                )
+            elif entry.in_backoff(now):
+                row.update(
+                    refreshStatus="deferred",
+                    reason="backoff",
+                    detail=ERROR_NOTES.get(
+                        entry.last_error or "", entry.last_error or "provider backoff"
+                    ),
+                    retryAt=_utc_timestamp(entry.backoff_until),
+                )
+            elif entry.sentinel is not None:
+                reason, _usage = usage_fields(entry.sentinel)
+                row.update(
+                    refreshStatus="unavailable",
+                    reason=reason,
+                    detail=SENTINEL_NOTES.get(entry.sentinel, entry.sentinel),
+                )
+            else:
+                row.update(
+                    refreshStatus="unavailable",
+                    reason="usage_unavailable",
+                    detail=ERROR_NOTES.get(
+                        entry.last_error or "", entry.last_error or "usage unavailable"
+                    ),
+                )
+
+        if row["refreshStatus"] != "refreshed":
+            current_age = (
+                max(0.0, now - entry.fetched_at)
+                if entry.fetched_at is not None
+                else None
+            )
+            row.update(
+                last_good_usage_fields(
+                    entry.last_good,
+                    entry.fetched_at,
+                    current_age,
+                )
+            )
+        return row
+
     def accounts_snapshot(self, fetch: set[str] | None = None) -> AccountsSnapshot:
         """One-pass structured snapshot of every managed account, for the TUI.
 
@@ -1794,12 +2035,14 @@ class ClaudeAccountSwitcher:
         }
 
     def set_poll_policy_inputs(
-        self, threshold: float, models: tuple[str, ...]
+        self,
+        thresholds: poll_policy.WindowThresholds,
+        models: tuple[str, ...],
     ) -> None:
         """Pin the threshold/models poll planning keys on (set by a hosted
         auto engine so cadence follows its effective, CLI-merged settings
         instead of the settings file)."""
-        self._poll_inputs_override = (threshold, models)
+        self._poll_inputs_override = (thresholds, models)
 
     def clear_poll_policy_inputs(self) -> None:
         """Drop the hosted engine's pin so poll planning falls back to the
@@ -1808,7 +2051,9 @@ class ClaudeAccountSwitcher:
         engine it belonged to is gone."""
         self._poll_inputs_override = None
 
-    def _poll_policy_inputs(self) -> tuple[float, tuple[str, ...]]:
+    def _poll_policy_inputs(
+        self,
+    ) -> tuple[poll_policy.WindowThresholds, tuple[str, ...]]:
         """Threshold + configured model names for poll planning: the hosting
         engine's pinned values when present, else the settings file (reloaded
         only when it changes — one stat per pass)."""
@@ -1822,7 +2067,10 @@ class ClaudeAccountSwitcher:
         if self._poll_inputs_cache is not None and self._poll_inputs_cache[0] == mtime:
             return self._poll_inputs_cache[1]
         loaded = load_settings(self.backup_dir)
-        inputs = (loaded.threshold, parse_model_names(loaded.model))
+        inputs = (
+            poll_policy.WindowThresholds.from_settings(loaded),
+            parse_model_names(loaded.model),
+        )
         self._poll_inputs_cache = (mtime, inputs)
         return inputs
 
@@ -4833,6 +5081,8 @@ class ClaudeAccountSwitcher:
         fetch: set[str] | None = None,
         *,
         scheduled: bool = False,
+        manual_refresh: bool = False,
+        trace: _UsageCollectionTrace | None = None,
     ) -> dict[str, UsageEntry]:
         """Store-backed usage collection: one :class:`UsageEntry` per account.
 
@@ -4849,6 +5099,13 @@ class ClaudeAccountSwitcher:
         the same plan. A failed fetch only updates the entry's error/backoff
         fields, so the last-good measurement keeps being served
         (stale-on-error).
+
+        ``manual_refresh`` is reserved for the explicit ``cswap refresh``
+        command. It asks the store to ignore successful-cache freshness and a
+        future poll plan, while keeping backoff, quarantine, and claim gates.
+        ``trace`` captures the attempted/accepted facts so that command can
+        report each account honestly instead of presenting cached data as a
+        fresh result.
         """
         store = self._usage_store
         identities = {
@@ -4886,12 +5143,29 @@ class ClaudeAccountSwitcher:
                     [num], {num: identities[num]}
                 )
                 entries = store.entries(identities, models)
+        if trace is not None:
+            # These states existed before reservation. They outrank an older
+            # stored backoff when the manual command explains why no request
+            # was made. The active-token-expired overlay is added later and is
+            # deliberately absent so a live concurrent claim can outrank it.
+            trace.static_sentinels = sentinels.copy()
         requested = [
             num
             for num in info_by_num
             if num not in sentinels and (fetch is None or num in fetch)
         ]
-        if fetch is None:
+        if manual_refresh:
+            rejections: dict[str, ReservationRejection] = {}
+            claims = store.reserve(
+                requested,
+                identities,
+                respect_plans=True,
+                manual_refresh=True,
+                rejections=rejections,
+            )
+            if trace is not None:
+                trace.rejections = rejections
+        elif fetch is None:
             # Repair reset-parked plans written by releases that stopped
             # polling exhausted accounts until their advertised reset. The
             # store recognizes that impossible deadline shape under the same
@@ -4910,6 +5184,8 @@ class ClaudeAccountSwitcher:
                 respect_plans=False,
                 repair_overslept=scheduled,
             )
+        if trace is not None:
+            trace.claims = claims
         # An expired ACTIVE credential that cannot reach the fetch path (and
         # its locked refresh) this tick — failure backoff, a concurrent
         # collector's claim, poll-plan gate — must still surface the expired
@@ -4933,7 +5209,18 @@ class ClaudeAccountSwitcher:
                 [info_by_num[num] for num in claims]
             )
             plans = self._plans_after_fetch(records, pre, info_by_num)
-            accepted = store.record(records, identities, claims, plans)
+            commits: dict[str, RecordCommit] = {}
+            accepted = store.record(
+                records,
+                identities,
+                claims,
+                plans,
+                commits,
+            )
+            if trace is not None:
+                trace.records = records
+                trace.accepted = accepted
+                trace.commits = commits
             accepted_records = {
                 num: record for num, record in records.items() if num in accepted
             }
@@ -5073,7 +5360,7 @@ class ClaudeAccountSwitcher:
         for when the backoff lifts.
         """
         now = self._usage_store.clock()
-        threshold, models = self._poll_policy_inputs()
+        thresholds, models = self._poll_policy_inputs()
         plans: dict[str, tuple[float | None, float | None]] = {}
         for num, rec in records.items():
             if rec.sentinel is not None or rec.error is not None:
@@ -5085,10 +5372,11 @@ class ClaudeAccountSwitcher:
                 prev_usage=before.last_good if before else None,
                 new_usage=rec.usage,
                 is_active=bool(info_by_num[num][4]),
-                threshold=threshold,
+                threshold=thresholds.five_hour,
                 models=models,
                 recent_429=recent_429,
                 now=now,
+                thresholds=thresholds,
             )
         return plans
 
@@ -6641,7 +6929,16 @@ class ClaudeAccountSwitcher:
         # ~/.claude.json.lock likewise keeps the oauthAccount splice from
         # interleaving with Claude Code's own config writes. Everything under
         # here is local I/O — no network while locks are held.
-        with FileLock(self.lock_file), claude_credentials_lock(), claude_config_lock():
+        # Match consume_backup_grant's lock order. An idle target's backup can
+        # rotate while its refresh POST is in flight; waiting on that slot's
+        # consume lock ensures activation reads the persisted successor rather
+        # than installing the now-consumed predecessor into the live store.
+        with (
+            FileLock(self.credentials_dir / f".consume-{target_account}.lock"),
+            FileLock(self.lock_file),
+            claude_credentials_lock(),
+            claude_config_lock(),
+        ):
             data = self._get_sequence_data()
             active_account = data.get("activeAccountNumber")
             recorded_current = (

@@ -17,7 +17,7 @@ from textual.binding import Binding
 from textual.reactive import reactive
 from textual.worker import WorkerState
 
-from claude_swap import printer
+from claude_swap import poll_policy, printer
 from claude_swap.models import AccountsSnapshot
 from claude_swap.snapshot_source import account_identity
 from claude_swap.settings import load_settings, load_ui_settings, set_setting
@@ -73,9 +73,13 @@ class CswapApp(App):
         # The auto-switch threshold, drawn as a tick on the status strip's
         # bars everywhere. Missing/invalid settings fall back to the default.
         try:
-            self.threshold_pct: float | None = load_settings(
-                switcher.backup_dir
-            ).threshold
+            loaded = load_settings(switcher.backup_dir)
+            thresholds = poll_policy.WindowThresholds.from_settings(loaded)
+            self.threshold_pct = (
+                thresholds.five_hour
+                if thresholds.five_hour == thresholds.seven_day
+                else None
+            )
         except Exception:
             self.threshold_pct = None
         try:

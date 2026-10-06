@@ -265,6 +265,26 @@ class FetchRecord:
 
 
 @dataclass(frozen=True)
+class RecordCommit:
+    """Store fields captured atomically when a fetch outcome is accepted."""
+
+    fetched_at: float | None
+    backoff_until: float | None
+    last_error: str | None
+    auth_dead_strikes: int
+
+
+@dataclass(frozen=True)
+class ReservationRejection:
+    """A hard reservation gate observed atomically under the store lock."""
+
+    reason: str
+    observed_at: float
+    backoff_until: float | None = None
+    claim_until: float | None = None
+
+
+@dataclass(frozen=True)
 class UsageEntry:
     """Read model of one account's usage state at collect time.
 
@@ -988,6 +1008,8 @@ class UsageStore:
         *,
         respect_plans: bool,
         repair_overslept: bool = False,
+        manual_refresh: bool = False,
+        rejections: dict[str, ReservationRejection] | None = None,
     ) -> dict[str, str]:
         """Atomically win the right to fetch: re-check eligibility and stamp
         a bounded lease in one locked pass, returning slot → fencing id.
@@ -1010,6 +1032,13 @@ class UsageStore:
           ``repair_overslept``, this becomes the non-escalating scheduler mode:
           due plans and stale impossible plans win, but valid future plans do
           not.
+        - ``manual_refresh=True`` (an explicit operator refresh): freshness and
+          ``nextPollAt`` are ignored, while dead-token quarantine, failure
+          backoff, and another collector's live claim remain hard gates.
+
+        When ``rejections`` is supplied, hard-gate decisions are copied into
+        it under this same lock. Schedule/freshness rejections are omitted;
+        manual refresh has none of those. Existing callers can omit it.
         """
         nums = list(nums)
         if not nums:
@@ -1025,8 +1054,17 @@ class UsageStore:
                     rows[num] = row = self._fresh_row(identity)
                 else:
                     assert isinstance(row, dict)
+                    rejection = _hard_reservation_rejection(row, now)
+                    if rejection is not None:
+                        if rejections is not None:
+                            rejections[num] = rejection
+                        continue
                     if not _row_eligible(
-                        row, now, respect_plans, repair_overslept
+                        row,
+                        now,
+                        respect_plans,
+                        repair_overslept,
+                        manual_refresh,
                     ):
                         continue
                 claim_id = uuid.uuid4().hex
@@ -1044,6 +1082,7 @@ class UsageStore:
         identities: dict[str, Identity],
         claims: dict[str, str] | None = None,
         plans: dict[str, tuple[float | None, float | None]] | None = None,
+        commits: dict[str, RecordCommit] | None = None,
     ) -> set[str]:
         """Merge outcomes fenced by the leases that produced them.
 
@@ -1054,7 +1093,11 @@ class UsageStore:
         in the same transaction as its measurement. Sentinel records clear
         only the claim and are otherwise never persisted. Unfenced callers
         (no ``claims``) defer to a live lease but never to an expired one.
-        Returns the accepted slots.
+        Returns the accepted slots. When ``commits`` is supplied, each
+        accepted row's timestamps/error are copied into it under the same
+        lock as the write. This lets a caller attribute an attempt without a
+        later collector's commit changing the reported metadata; existing
+        callers can omit it.
         """
         if not outcomes:
             return set()
@@ -1132,6 +1175,13 @@ class UsageStore:
                     rows[num] = row = self._fresh_row(identity)
                 assert isinstance(row, dict)
                 apply(num, row)
+                if commits is not None:
+                    commits[num] = RecordCommit(
+                        fetched_at=_num_or_none(row.get("fetchedAt")),
+                        backoff_until=_num_or_none(row.get("backoffUntil")),
+                        last_error=row.get("lastError"),
+                        auth_dead_strikes=int(row.get("authDeadStrikes") or 0),
+                    )
             if accepted:
                 self._write_rows(rows)
         return accepted
@@ -1183,21 +1233,18 @@ def _num_or_none(value: object) -> float | None:
 
 
 def _row_eligible(
-    row: dict, now: float, respect_plans: bool, repair_overslept: bool = False
+    row: dict,
+    now: float,
+    respect_plans: bool,
+    repair_overslept: bool = False,
+    manual_refresh: bool = False,
 ) -> bool:
     """Fetch eligibility of a stored row, evaluated under the write lock
     (see :meth:`UsageStore.reserve` for the two caller modes)."""
-    if int(row.get("authDeadStrikes") or 0) >= AUTH_DEAD_STRIKES:
+    if _hard_reservation_rejection(row, now) is not None:
         return False
-    backoff_until = _num_or_none(row.get("backoffUntil"))
-    if backoff_until is not None and now < backoff_until:
-        return False
-    if _live_claim(
-        _num_or_none(row.get("claimUntil")),
-        _num_or_none(row.get("lastAttemptAt")),
-        now,
-    ):
-        return False
+    if manual_refresh:
+        return True
     fetched_at = _num_or_none(row.get("fetchedAt"))
     stale = fetched_at is None or (now - fetched_at) > SERVE_TTL_S
     next_poll_at = _num_or_none(row.get("nextPollAt"))
@@ -1212,6 +1259,33 @@ def _row_eligible(
     if repair_overslept:
         return poll_due or (stale and (next_poll_at is None or overslept))
     return poll_due or stale
+
+
+def _hard_reservation_rejection(
+    row: dict, now: float
+) -> ReservationRejection | None:
+    """Return the quarantine/backoff/claim gate visible at ``now``."""
+    if int(row.get("authDeadStrikes") or 0) >= AUTH_DEAD_STRIKES:
+        return ReservationRejection("quarantine", now)
+    backoff_until = _num_or_none(row.get("backoffUntil"))
+    if backoff_until is not None and now < backoff_until:
+        return ReservationRejection(
+            "backoff",
+            now,
+            backoff_until=backoff_until,
+        )
+    claim_until = _num_or_none(row.get("claimUntil"))
+    last_attempt_at = _num_or_none(row.get("lastAttemptAt"))
+    if _live_claim(claim_until, last_attempt_at, now):
+        effective_until = claim_until
+        if effective_until is None and last_attempt_at is not None:
+            effective_until = last_attempt_at + LEGACY_CLAIM_TTL_S
+        return ReservationRejection(
+            "claim",
+            now,
+            claim_until=effective_until,
+        )
+    return None
 
 
 def with_sentinel(entry: UsageEntry, sentinel: str | None) -> UsageEntry:

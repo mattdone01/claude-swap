@@ -381,23 +381,63 @@ class TestDecisionTable:
             "no-active-account"
         ]
 
-    def test_hysteresis_margin_blocks_marginal_candidates(self, harness):
-        # threshold 90, hysteresis 10 → a candidate must beat the active
-        # account's utilization by >= 10 points; 95→86 is only 9 better.
-        # Failing the margin is NOT exhaustion: no all-exhausted event, no
-        # reset-sleep — the next tick must stay at normal cadence so the
-        # at-limit escape isn't missed when the active account tops out.
+    def test_threshold_crossing_takes_strictly_better_healthy_candidate(
+        self, harness
+    ):
+        # A full relative hysteresis margin used to strand this account until
+        # 100%. Once the active is over the threshold, the best fresh landing
+        # below it only needs to be strictly better; cooldown and the persisted
+        # no-return guard own reversal prevention.
         outcome = harness.tick_with_usage({
             "1": _usage(95), "2": _usage(86), "3": _usage(88),
         })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 2
+        switch = next(e for e in harness.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "proactive"
+
+    def test_incident_shape_switches_before_limit_with_ten_point_setting(
+        self, temp_home
+    ):
+        h = EngineHarness(
+            temp_home,
+            threshold=94.0,
+            hysteresis_pct=10.0,
+            cooldown_seconds=0.0,
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        usage = {"1": _usage(95.0), "2": _usage(89.0)}
+
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+        h.clock.advance(60)
+        h.events.clear()
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert h.active_number() == 2
+        assert next(
+            e.reason for e in h.events if isinstance(e, NoSwitchEvent)
+        ) == "below-threshold"
+
+    def test_proactive_requires_target_strictly_below_threshold(
+        self, temp_home
+    ):
+        h = EngineHarness(
+            temp_home, threshold=94.0, hysteresis_pct=10.0
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        outcome = h.tick_with_usage({"1": _usage(95.0), "2": _usage(94.0)})
+
         assert outcome is TickOutcome.BLOCKED
-        assert harness.active_number() == 1
-        assert not any(isinstance(e, AllExhaustedEvent) for e in harness.events)
-        reasons = [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)]
-        assert reasons == ["no-qualifying-candidate"]
-        assert harness.engine._sleep_until_ts is None
-        delay = harness.engine._next_delay(outcome)
-        assert delay <= 1.1 * harness.settings.interval_seconds
+        assert h.active_number() == 1
+        assert next(
+            e.reason for e in h.events if isinstance(e, NoSwitchEvent)
+        ) == "no-qualifying-candidate"
 
     def test_issue_115_strictly_better_candidate_switches(self, harness):
         # Regression for #115: active bound by 5h (99%), candidate bound by
@@ -2386,7 +2426,10 @@ class TestSessionThreshold:
         harness.engine.apply_threshold(72.0)
         assert harness.engine.settings.threshold == 72.0
         # Poll-cadence planning follows the new value immediately.
-        assert harness.switcher._poll_inputs_override == (72.0, ())
+        assert harness.switcher._poll_inputs_override == (
+            poll_policy.WindowThresholds(72.0, 72.0),
+            (),
+        )
         # And the very next tick decides with it: 80% ≥ 72 switches, where
         # the constructed 90 would not have.
         outcome = harness.tick_with_usage({
@@ -2949,6 +2992,109 @@ def _usage7(pct5: float, pct7: float, reset7: str | None = None) -> dict:
     if reset7:
         seven["resets_at"] = reset7
     return {"five_hour": {"pct": pct5}, "seven_day": seven}
+
+
+class TestPerWindowThresholds:
+    def _harness(self, temp_home: Path, **kwargs) -> EngineHarness:
+        h = EngineHarness(
+            temp_home,
+            five_hour_threshold=94.0,
+            seven_day_threshold=98.0,
+            **kwargs,
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_five_hour_boundary_triggers_even_with_low_weekly_usage(
+        self, temp_home
+    ):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(94.0, 20.0),
+            "2": _usage7(20.0, 40.0),
+            "3": _usage7(30.0, 50.0),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_below_five_hour_boundary_holds(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(93.999, 20.0),
+            "2": _usage7(20.0, 40.0),
+            "3": _usage7(30.0, 50.0),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_weekly_boundary_triggers(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(20.0, 98.0),
+            "2": _usage7(20.0, 97.0),
+            "3": _usage7(30.0, 97.5),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_fable_uses_weekly_threshold_when_selected(self, temp_home):
+        h = self._harness(temp_home, model="Fable")
+        outcome = h.tick_with_usage({
+            "1": _model_usage(20.0, 98.0),
+            "2": _model_usage(20.0, 97.0),
+            "3": _model_usage(30.0, 97.5),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_mixed_windows_rank_by_policy_runway(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            # Active has 6 raw points to exhaustion but zero policy runway.
+            "1": _usage7(94.0, 20.0),
+            # Candidate has only 3 raw points, yet remains one point under its
+            # weekly switch threshold and is therefore the valid better target.
+            "2": _usage7(20.0, 97.0),
+            "3": _usage7(94.0, 10.0),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_candidate_at_five_hour_boundary_is_not_healthy(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(94.0, 20.0),
+            "2": _usage7(94.0, 5.0),
+            "3": _usage7(20.0, 97.0),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_hard_limit_escape_still_uses_raw_positive_headroom(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(100.0, 20.0),
+            "2": _usage7(95.0, 20.0),
+            "3": _usage7(100.0, 20.0),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_poll_event_reports_both_thresholds(self, temp_home):
+        h = self._harness(temp_home)
+        h.tick_with_usage({
+            "1": _usage7(20.0, 20.0),
+            "2": _usage7(30.0, 30.0),
+            "3": _usage7(40.0, 40.0),
+        })
+        poll = next(event for event in h.events if isinstance(event, PollEvent))
+        assert poll.to_json()["thresholds"] == {
+            "fiveHour": 94.0,
+            "sevenDay": 98.0,
+        }
 
 
 class TestConsumeFirstStrategy:
@@ -3546,9 +3692,9 @@ class TestEveryAccountAboveThreshold:
     received, so once that limit lands no credential swap can shorten it; the
     only cure is not to arrive there.
 
-    Below the threshold nothing changes: a single healthy peer still wins the
-    normal way, and the hysteresis margin still keeps two near-line accounts
-    from ping-ponging.
+    Below the threshold nothing changes: the healthy active account stays put.
+    Above it, a single healthy peer still wins the normal way, while cooldown
+    and the no-return guard prevent reversals.
     """
 
     def _at(self, harness, seconds: float) -> str:
@@ -6771,7 +6917,7 @@ class TestEscapeBeforeTheLimitLands:
     100% before escaping, and set out to move the trigger a point earlier.
     Measuring it refuted that: at 99% with a peer that has real headroom, the
     engine switches on the ORDINARY proactive path, because 99% is above the
-    threshold and the peer clears the hysteresis margin easily.
+    threshold and the peer is a healthy, strictly better landing.
 
     What actually happened in the 18:50 observation that prompted this: the
     only peers were 99% (one point) and 100% (never a target), so there was
@@ -6794,7 +6940,7 @@ class TestEscapeBeforeTheLimitLands:
 
     def test_at_99_the_proactive_path_already_escapes(self, harness):
         """No special trigger needed: 99% is over the threshold and a healthy
-        peer clears the margin."""
+        peer is strictly better."""
         outcome = harness.tick_with_usage({
             "1": _usage(99, self._at(harness, 109 * 3600)),  # active, 1 left
             "2": _usage(70, self._at(harness, 80 * 3600)),   # 30 left
@@ -6819,7 +6965,7 @@ class TestEscapeBeforeTheLimitLands:
         assert outcome is not TickOutcome.SWITCHED
 
     def test_below_the_brink_the_ordinary_rules_still_decide(self, harness):
-        """A comfortable account is untouched: the hysteresis margin applies."""
+        """A comfortable account is untouched below the threshold."""
         outcome = harness.tick_with_usage({
             "1": _usage(50, self._at(harness, 109 * 3600)),
             "2": _usage(45, self._at(harness, 80 * 3600)),
@@ -7116,11 +7262,414 @@ class TestTelemetrySafety:
         ]
         assert harness.active_number() == 2
 
+    def test_first_failed_fetch_immediately_starts_unhealthy_grace(
+        self, temp_home
+    ):
+        h = EngineHarness(
+            temp_home,
+            threshold=94.0,
+            hysteresis_pct=10.0,
+            unhealthy_ticks=3,
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+
+        outcome = h.tick_with_entries({
+            "1": UsageEntry(
+                last_good=_usage(76.0),
+                fetched_at=now,
+                age_s=0.0,
+                last_attempt_at=now,
+                consecutive_failures=1,
+                last_error="http-429",
+                backoff_until=now + 1151.0,
+                trust_extended=True,
+            ),
+            "2": UsageEntry(last_good=_usage(10.0), fetched_at=now, age_s=0.0),
+        })
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.engine._unhealthy_ticks == 1
+        event = next(e for e in h.events if isinstance(e, NoSwitchEvent))
+        assert event.reason == "active-usage-unknown"
+        assert event.detail.startswith("1/3")
+
+    def test_failure_older_than_success_does_not_invalidate_measurement(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home, threshold=94.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+
+        outcome = h.tick_with_entries({
+            "1": UsageEntry(
+                last_good=_usage(76.0),
+                fetched_at=now,
+                age_s=0.0,
+                last_attempt_at=now - 1.0,
+                consecutive_failures=1,
+                last_error="timeout",
+            ),
+            "2": UsageEntry(last_good=_usage(10.0), fetched_at=now, age_s=0.0),
+        })
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.engine._unhealthy_ticks == 0
+        event = next(e for e in h.events if isinstance(e, NoSwitchEvent))
+        assert event.reason == "below-threshold"
+
+    def test_active_network_failure_can_fail_over_to_verified_alternate(
+        self, temp_home
+    ):
+        h = EngineHarness(
+            temp_home,
+            threshold=94.0,
+            hysteresis_pct=10.0,
+            unhealthy_ticks=1,
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+
+        outcome = h.tick_with_entries({
+            "1": UsageEntry(
+                last_good=_usage(76.0),
+                fetched_at=now,
+                age_s=0.0,
+                last_attempt_at=now,
+                consecutive_failures=1,
+                last_error="network",
+            ),
+            "2": UsageEntry(last_good=_usage(20.0), fetched_at=now, age_s=0.0),
+        })
+
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "failover"
+
+    def test_system_wide_network_outage_holds_until_a_target_is_verified(
+        self, temp_home
+    ):
+        h = EngineHarness(
+            temp_home,
+            threshold=94.0,
+            hysteresis_pct=10.0,
+            unhealthy_ticks=1,
+            cooldown_seconds=0.0,
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+
+        def failed(pct):
+            return UsageEntry(
+                last_good=_usage(pct),
+                fetched_at=now,
+                age_s=0.0,
+                last_attempt_at=now,
+                consecutive_failures=1,
+                last_error="network",
+            )
+
+        outage = {"1": failed(76.0), "2": failed(10.0), "3": failed(20.0)}
+        for _ in range(3):
+            h.events.clear()
+            assert h.tick_with_entries(outage) is TickOutcome.BLOCKED
+            assert h.active_number() == 1
+            assert next(
+                e.reason for e in h.events if isinstance(e, NoSwitchEvent)
+            ) == "no-safe-failover-target"
+
+        h.events.clear()
+        recovered = dict(outage)
+        recovered["2"] = UsageEntry(
+            last_good=_usage(10.0), fetched_at=now, age_s=0.0
+        )
+        assert h.tick_with_entries(recovered) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_candidate_current_error_blocks_proactive_activation(self, harness):
+        now = harness.clock.now
+        outcome = harness.tick_with_entries({
+            "1": UsageEntry(last_good=_usage(95), fetched_at=now, age_s=0.0),
+            "2": UsageEntry(
+                last_good=_usage(10),
+                fetched_at=now,
+                age_s=0.0,
+                last_attempt_at=now,
+                consecutive_failures=1,
+                last_error="network",
+            ),
+            "3": UsageEntry(
+                last_good=_usage(20),
+                fetched_at=now,
+                age_s=0.0,
+                last_attempt_at=now,
+                consecutive_failures=1,
+                last_error="timeout",
+            ),
+        })
+
+        assert outcome is TickOutcome.BLOCKED
+        assert harness.active_number() == 1
+        event = next(e for e in harness.events if isinstance(e, NoSwitchEvent))
+        assert event.reason == "no-fresh-candidate"
+
+    def test_candidate_error_older_than_success_does_not_block_activation(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home, threshold=94.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+
+        outcome = h.tick_with_entries({
+            "1": UsageEntry(last_good=_usage(95), fetched_at=now, age_s=0.0),
+            "2": UsageEntry(
+                last_good=_usage(89),
+                fetched_at=now,
+                age_s=0.0,
+                last_attempt_at=now - 1.0,
+                consecutive_failures=1,
+                last_error="network",
+            ),
+        })
+
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_candidate_inflight_fetch_blocks_until_success_completes(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home, threshold=94.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+        active = UsageEntry(last_good=_usage(95), fetched_at=now, age_s=0.0)
+        pending = UsageEntry(
+            last_good=_usage(89),
+            fetched_at=now - 1.0,
+            age_s=1.0,
+            last_attempt_at=now,
+            claim_until=now + 90.0,
+        )
+
+        assert h.tick_with_entries({"1": active, "2": pending}) is (
+            TickOutcome.BLOCKED
+        )
+        assert h.active_number() == 1
+
+        h.clock.advance(1.0)
+        h.events.clear()
+        succeeded = UsageEntry(
+            last_good=_usage(89),
+            fetched_at=h.clock.now,
+            age_s=0.0,
+            last_attempt_at=h.clock.now,
+            claim_until=0.0,
+        )
+        assert h.tick_with_entries({"1": active, "2": succeeded}) is (
+            TickOutcome.SWITCHED
+        )
+        assert h.active_number() == 2
+
+    def test_active_inflight_fetch_does_not_start_unhealthy_grace(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home, threshold=94.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+
+        outcome = h.tick_with_entries({
+            "1": UsageEntry(
+                last_good=_usage(76),
+                fetched_at=now - 1.0,
+                age_s=1.0,
+                last_attempt_at=now,
+                claim_until=now + 90.0,
+            ),
+            "2": UsageEntry(last_good=_usage(10), fetched_at=now, age_s=0.0),
+        })
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.engine._unhealthy_ticks == 0
+        event = next(e for e in h.events if isinstance(e, NoSwitchEvent))
+        assert event.reason == "below-threshold"
+
+    def test_target_inflight_fetch_before_write_refuses_activation(self, harness):
+        original = harness.switcher.switch_to
+
+        def claim_target(*args, **kwargs):
+            harness.switcher._usage_store.claim(
+                {"2"}, {"2": ("b@example.com", "")}
+            )
+            return original(*args, **kwargs)
+
+        with patch.object(
+            harness.switcher, "switch_to", side_effect=claim_target
+        ):
+            outcome = harness.tick_with_usage({
+                "1": _usage(95), "2": _usage(10), "3": _usage(20),
+            })
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert harness.active_number() == 1
+        event = next(e for e in harness.events if isinstance(e, NoSwitchEvent))
+        assert event.reason == "stale-usage"
+
+    @pytest.mark.parametrize("unverified", ["pending", "error"])
+    def test_unverified_peer_prevents_false_all_exhausted_sleep_and_recovers(
+        self, temp_home, unverified
+    ):
+        h = EngineHarness(temp_home, threshold=94.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+        peer = UsageEntry(
+            last_good=_usage(10),
+            fetched_at=now - 1.0,
+            age_s=1.0,
+            last_attempt_at=now,
+            claim_until=now + 90.0 if unverified == "pending" else 0.0,
+            consecutive_failures=1 if unverified == "error" else 0,
+            last_error="network" if unverified == "error" else None,
+        )
+        exhausted = UsageEntry(
+            last_good=_usage(100), fetched_at=now, age_s=0.0
+        )
+
+        outcome = h.tick_with_entries({
+            "1": exhausted, "2": peer, "3": exhausted,
+        })
+
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert not any(isinstance(e, AllExhaustedEvent) for e in h.events)
+        assert h.engine._blocked_wait_long is False
+        assert h.engine._next_delay(outcome) <= 1.1 * h.settings.interval_seconds
+
+        h.clock.advance(1.0)
+        h.events.clear()
+        recovered = UsageEntry(
+            last_good=_usage(10),
+            fetched_at=h.clock.now,
+            age_s=0.0,
+            last_attempt_at=h.clock.now,
+            claim_until=0.0,
+        )
+        assert h.tick_with_entries({
+            "1": exhausted, "2": recovered, "3": exhausted,
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_verified_all_exhausted_fleet_keeps_slow_cadence(self, harness):
+        now = harness.clock.now
+        exhausted = UsageEntry(
+            last_good=_usage(100),
+            fetched_at=now,
+            age_s=0.0,
+            last_attempt_at=now,
+            claim_until=0.0,
+        )
+
+        outcome = harness.tick_with_entries({
+            "1": exhausted, "2": exhausted, "3": exhausted,
+        })
+
+        assert outcome is TickOutcome.BLOCKED
+        assert harness.active_number() == 1
+        assert any(isinstance(e, AllExhaustedEvent) for e in harness.events)
+        assert harness.engine._blocked_wait_long is True
+        assert harness.engine._next_delay(outcome) >= 300.0
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+    @pytest.mark.parametrize("window", ["five_hour", "seven_day", "scoped"])
+    def test_nonfinite_active_window_is_unknown_and_uses_safe_failover(
+        self, temp_home, bad, window
+    ):
+        model = "Fable" if window == "scoped" else ""
+        h = EngineHarness(
+            temp_home,
+            threshold=94.0,
+            hysteresis_pct=10.0,
+            unhealthy_ticks=1,
+            model=model,
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        active = {
+            "five_hour": {"pct": 95.0},
+            "seven_day": {"pct": 20.0},
+            "scoped": [{"name": "Fable", "pct": 30.0}],
+        }
+        if window == "scoped":
+            active["scoped"][0]["pct"] = bad
+        else:
+            active[window]["pct"] = bad
+
+        outcome = h.tick_with_usage({"1": active, "2": _usage(10)})
+
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "failover"
+
+    @pytest.mark.parametrize(
+        ("active", "expected_trigger"),
+        [(_usage(95), "proactive"), (_usage(100), "at-limit"), (None, "failover")],
+    )
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+    @pytest.mark.parametrize("window", ["five_hour", "seven_day", "scoped"])
+    def test_nonfinite_candidate_window_never_activates_for_any_trigger(
+        self, temp_home, active, expected_trigger, bad, window
+    ):
+        model = "Fable" if window == "scoped" else ""
+        h = EngineHarness(
+            temp_home,
+            threshold=94.0,
+            hysteresis_pct=10.0,
+            unhealthy_ticks=1,
+            model=model,
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        candidate = {
+            "five_hour": {"pct": 10.0},
+            "seven_day": {"pct": 20.0},
+            "scoped": [{"name": "Fable", "pct": 30.0}],
+        }
+        if window == "scoped":
+            candidate["scoped"][0]["pct"] = bad
+        else:
+            candidate[window]["pct"] = bad
+
+        outcome = h.tick_with_usage({"1": active, "2": candidate})
+
+        assert outcome is TickOutcome.BLOCKED, expected_trigger
+        assert h.active_number() == 1
+        assert not any(isinstance(e, SwitchEvent) for e in h.events)
+
     def test_long_429_remains_unavailable_near_deadline(self, harness):
         now = harness.clock.now
         entries = {
             "1": UsageEntry(
-                last_good=_usage(44), fetched_at=now - 10, age_s=10,
+                last_good=_usage(44), fetched_at=now - 600, age_s=600,
                 last_attempt_at=now - 590, consecutive_failures=1,
                 last_error="http-429", backoff_until=now + 10,
                 trust_extended=True,

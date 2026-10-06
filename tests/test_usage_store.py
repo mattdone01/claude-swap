@@ -16,6 +16,8 @@ from claude_swap.usage_store import (
     STALE_OK_S,
     TRUST_MAX_AGE_S,
     FetchRecord,
+    RecordCommit,
+    ReservationRejection,
     UsageEntry,
     UsageStore,
     due_candidate,
@@ -950,6 +952,69 @@ class TestClaims:
         assert entry.last_good == USAGE
         assert entry.age_s == 100.0
 
+    def test_manual_refresh_bypasses_fresh_cache_and_future_plan(
+        self, store, clock
+    ):
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        store.set_poll_plan({"1": (clock.now + 600.0, 600.0)}, IDENT)
+
+        claims = store.reserve(
+            ["1"], IDENT, respect_plans=True, manual_refresh=True
+        )
+
+        assert set(claims) == {"1"}
+
+    def test_manual_refresh_still_honors_backoff_quarantine_and_live_claim(
+        self, store, clock
+    ):
+        identities = {**IDENT, "3": ("c@x.com", "org-3")}
+        store.record({"1": FetchRecord(error="timeout")}, identities)
+        store.claim(["2"], identities)
+        store.record({"3": FetchRecord(error="invalid_grant")}, identities)
+
+        claims = store.reserve(
+            ["1", "2", "3"],
+            identities,
+            respect_plans=True,
+            manual_refresh=True,
+        )
+
+        assert claims == {}
+
+    def test_manual_refresh_snapshots_hard_rejections_under_reservation_lock(
+        self, store, clock
+    ):
+        identities = {**IDENT, "3": ("c@x.com", "org-3")}
+        store.record({"1": FetchRecord(error="timeout")}, identities)
+        store.claim(["2"], identities)
+        store.record({"3": FetchRecord(error="invalid_grant")}, identities)
+        entries = store.entries(identities)
+        rejections: dict[str, ReservationRejection] = {}
+
+        claims = store.reserve(
+            ["1", "2", "3"],
+            identities,
+            respect_plans=True,
+            manual_refresh=True,
+            rejections=rejections,
+        )
+
+        assert claims == {}
+        assert rejections["1"] == ReservationRejection(
+            "backoff",
+            clock.now,
+            backoff_until=entries["1"].backoff_until,
+        )
+        assert rejections["2"] == ReservationRejection(
+            "claim",
+            clock.now,
+            claim_until=entries["2"].claim_until,
+        )
+        assert rejections["3"] == ReservationRejection(
+            "quarantine",
+            clock.now,
+        )
+
     def test_live_claim_outlasts_urgent_poll_interval(self, store, clock):
         claims = store.reserve(["1"], IDENT, respect_plans=True)
         assert set(claims) == {"1"}
@@ -961,6 +1026,27 @@ class TestClaims:
         assert store.entries(IDENT)["1"].claimed(clock.now)
         assert store.record({"1": FetchRecord(usage=USAGE)}, IDENT, claims) == {"1"}
         assert not store.entries(IDENT)["1"].claimed(clock.now)
+
+    def test_record_captures_commit_metadata_inside_outcome_write(
+        self, store, clock
+    ):
+        claims = store.reserve(["1"], IDENT, respect_plans=True)
+        commits: dict[str, RecordCommit] = {}
+
+        accepted = store.record(
+            {"1": FetchRecord(usage=USAGE)},
+            IDENT,
+            claims,
+            commits=commits,
+        )
+
+        assert accepted == {"1"}
+        assert commits["1"] == RecordCommit(
+            fetched_at=clock.now,
+            backoff_until=None,
+            last_error=None,
+            auth_dead_strikes=0,
+        )
 
     def test_failure_releases_claim(self, store, clock):
         claims = store.reserve(["1"], IDENT, respect_plans=True)

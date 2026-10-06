@@ -38,12 +38,18 @@ class AutoSwitchSettings:
     leaves margin for the macOS ~30s Keychain pickup tail and for heavy
     subagent turns burning past the mark before a swap lands. A proactive
     candidate must itself sit below the threshold (never land somewhere that
-    re-triggers next tick) and beat the active account's utilization by at
-    least ``hysteresis_pct``, so two accounts hovering at the line never
-    ping-pong while a strictly better account is always taken.
+    re-triggers next tick) and be strictly better than the active account.
+    ``hysteresis_pct`` is the absolute runway required when the active usage is
+    unknown; cooldown plus the persisted no-return guard bound proactive
+    reversals.
     """
 
     threshold: float = 90.0
+    # Optional per-window overrides. ``None`` preserves the legacy global
+    # threshold for that window. Selected per-model weekly windows use the
+    # seven-day threshold because they are weekly quota limits too.
+    five_hour_threshold: float | None = None
+    seven_day_threshold: float | None = None
     interval_seconds: float = 60.0
     cooldown_seconds: float = 300.0
     hysteresis_pct: float = 10.0
@@ -107,6 +113,16 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             help="Switch when the binding 5h/7d window reaches this pct",
         ),
         SettingSpec(
+            "autoswitch", "fiveHourThreshold", "five_hour_threshold",
+            "optional_float", 1.0, 99.9,
+            help="Override the switch threshold for the 5-hour window",
+        ),
+        SettingSpec(
+            "autoswitch", "sevenDayThreshold", "seven_day_threshold",
+            "optional_float", 1.0, 99.9,
+            help="Override the switch threshold for 7-day and selected model windows",
+        ),
+        SettingSpec(
             "autoswitch", "intervalSeconds", "interval_seconds", "float", 15.0, 3600.0,
             help="Poll interval for the cswap auto loop, in seconds",
         ),
@@ -116,7 +132,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch", "hysteresisPct", "hysteresis_pct", "float", 0.0, 50.0,
-            help="A target must beat the active account by this many pct",
+            help="Unknown-source failover target margin below the threshold",
         ),
         SettingSpec(
             "autoswitch", "strategy", "strategy", "choice",
@@ -180,7 +196,9 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
         if spec.section != "autoswitch":
             continue
         value = getattr(settings, spec.field)
-        if spec.kind in ("float", "int"):
+        if spec.kind == "optional_float" and value is None:
+            kwargs[spec.field] = None
+        elif spec.kind in ("float", "int", "optional_float"):
             clamped = num(value, spec.default, spec.lo, spec.hi)
             kwargs[spec.field] = int(clamped) if spec.kind == "int" else clamped
         elif spec.kind == "bool":
@@ -385,6 +403,24 @@ def set_setting(backup_root: Path, dotted_key: str, raw_value: str):
     return value
 
 
+def set_global_threshold(backup_root: Path, raw_value: str) -> float:
+    """Set the global threshold and clear both window overrides atomically."""
+    spec = setting_spec("autoswitch.threshold")
+    value = parse_setting_value(spec, raw_value)
+    path = settings_path(backup_root)
+    raw = _read_raw_for_write(path)
+    raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
+    section = raw.get("autoswitch")
+    if not isinstance(section, dict):
+        section = {}
+    section[spec.json_key] = value
+    section.pop("fiveHourThreshold", None)
+    section.pop("sevenDayThreshold", None)
+    raw["autoswitch"] = section
+    atomic_write_json(path, raw)
+    return value
+
+
 def unset_setting(backup_root: Path, dotted_key: str) -> bool:
     """Remove one key from settings.json; False if it wasn't set (no write)."""
     spec = setting_spec(dotted_key)
@@ -424,8 +460,18 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
 def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
     """Overlay non-None CLI overrides (argparse Namespace) onto settings."""
     overrides = {}
+    # An explicit legacy/global CLI threshold means the same thing it always
+    # did for this invocation: apply to every selected window. Window-specific
+    # CLI flags below may then refine either side.
+    if getattr(args, "threshold", None) is not None:
+        overrides.update(
+            threshold=args.threshold,
+            five_hour_threshold=None,
+            seven_day_threshold=None,
+        )
     for attr, field in (
-        ("threshold", "threshold"),
+        ("five_hour_threshold", "five_hour_threshold"),
+        ("seven_day_threshold", "seven_day_threshold"),
         ("interval", "interval_seconds"),
         ("cooldown", "cooldown_seconds"),
         ("include_api_key_accounts", "include_api_key_accounts"),

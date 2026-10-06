@@ -18,6 +18,7 @@ import pytest
 
 from claude_swap import menubar
 from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.settings import AutoSwitchSettings
 from claude_swap.switcher import USAGE_API_KEY
 
 
@@ -107,6 +108,22 @@ def test_settings_ignores_unknown_and_bad_types(tmp_path: Path):
     # bad-typed refresh_interval falls back to default; valid bool is kept
     assert s.refresh_interval == 60
     assert s.show_account_name is False
+
+
+def test_threshold_menu_checks_only_matching_global_preset():
+    assert menubar.auto_threshold_menu_state(
+        AutoSwitchSettings(threshold=90.0)
+    ) == (90, None)
+
+
+def test_threshold_menu_reports_split_effective_policy_as_custom():
+    assert menubar.auto_threshold_menu_state(
+        AutoSwitchSettings(
+            threshold=90.0,
+            five_hour_threshold=94.0,
+            seven_day_threshold=98.0,
+        )
+    ) == (None, "Custom: 5h 94% / 7d 98%")
 
 
 _USAGE = {

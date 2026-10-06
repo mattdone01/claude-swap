@@ -87,6 +87,7 @@ Let claude-swap watch your usage and switch for you. When the active account's 5
 ```bash
 cswap auto                     # foreground loop, polls every 60s
 cswap auto --threshold 80      # switch earlier
+cswap auto --five-hour-threshold 94 --seven-day-threshold 98
 cswap auto --model Fable       # also switch when the Fable weekly limit is hit
 cswap auto --once              # single check-and-switch, for cron/scripts
 cswap auto --dry-run           # log what it would do, never switch
@@ -97,10 +98,10 @@ cswap auto --strategy consume-first   # burn the soonest-resetting account first
 <summary>How it behaves & advanced usage</summary>
 
 - Runs safely alongside Claude Code: switches take the same credential locks Claude Code uses, so a swap never collides with a token refresh.
-- A cooldown (default 5 min) and a hysteresis margin stop it flip-flopping near the threshold: a proactive switch only lands on an account that's below the threshold *and* better than the current one by the margin — a candidate that clears the margin is always taken, but two accounts hovering at the line never ping-pong. When every account is exhausted it keeps checking on a bounded slow cadence, waking sooner for an imminent reset.
+- A cooldown (default 5 min) and a no-return recovery guard stop it flip-flopping near the threshold: after the active account reaches the threshold, a proactive switch lands on the best freshly verified account that's below the threshold and strictly better. The configured hysteresis margin remains the absolute runway required for an unknown-source failover. When every account is exhausted it keeps checking on a bounded slow cadence, waking sooner for an imminent reset.
 - **Strategies** (`--strategy`, or `cswap config set autoswitch.strategy`): `best` (default) stays put until the active account nears its limit, then moves to the account with the most quota left. `consume-first` proactively keeps you on the account whose **weekly window resets soonest** — use-it-or-lose-it — switching to a sooner-resetting account (with room to spare) even below the threshold, so perishable weekly quota isn't wasted.
 - Usage polling is adaptive — a couple of accounts per check, busy alternates watched more closely, and exhausted ones checked about every ten minutes (or slower after 429s) — so API traffic stays flat no matter how many accounts you manage.
-- It fails safe: brief usage-check errors keep the last-known numbers while retries back off. A prolonged usage-endpoint 429 is treated as lost telemetry, not as proof that quota is exhausted: after the configured unhealthy grace and switch cooldown, failover moves only to an alternate with fresh, finite binding utilization below both the threshold and `threshold - hysteresis` (for 97% / 10 points, at most 87% used), and reports `no-safe-failover-target` at the normal check cadence when none qualifies. A measured source at 100% can still escape to any fresh alternate with positive headroom, and explicitly opted-in API-key fallback is unchanged. Poll events show the last fetch error and measurement age even while cached usage remains visible. An expired token on an idle machine makes it hold rather than fail over (Claude Code refreshes the token on your next message).
+- It fails safe: a failed latest usage check immediately invalidates below-threshold evidence for the active account and starts the configured unhealthy grace; a cached reading already at or above the threshold remains conservative evidence to move. Failover moves only to an alternate whose latest usage fetch succeeded and whose finite binding utilization is below both the threshold and `threshold - hysteresis` (for 97% / 10 points, at most 87% used). If every account's latest check failed during a network outage, it holds instead of rotating through cached candidates. A measured source at 100% can still escape to any freshly verified alternate with positive headroom, and explicitly opted-in API-key fallback is unchanged. Poll events show the last fetch error and measurement age even while cached usage remains visible. An expired token on an idle machine makes it hold rather than fail over (Claude Code refreshes the token on your next message).
 - An account whose refresh token has died is quarantined and reported until you either log in with it and re-run `cswap add --slot N`, or replace its stored credentials from a known-good export — a plain `cswap import backup.cswap` replaces dead-token slots on its own (`--force` is still required to replace other existing accounts; note a stale export can carry an already-superseded token). API-key accounts are never rotated onto unless you pass `--include-api-key-accounts`.
 - To hold an account out of rotation yourself — a work account you don't want touched, one you're resting — run `cswap disable <num|email>`; `cswap enable <num|email>` puts it back. Disabled accounts are skipped by auto-switch, bare `cswap switch`, and the `best` / `next-available` strategies, but stay fully managed and remain a valid explicit `cswap switch <num|email>` target. They show a `(disabled)` marker in `cswap list`, in the [TUI](#interactive-dashboard-tui), and in the [menu bar](#menu-bar-macos) — both of which also let you toggle the state in place (TUI: menu → *Disable / enable account…*; menu bar: *Disable / enable account*).
 - By default only the account-wide 5h/7d windows drive switching. If you work on one model and hit its **weekly per-model limit** first (e.g. Fable), add `--model Fable` (or `cswap config set autoswitch.model Fable`) to fold that model's window into the decision, so it switches off an account whose model quota is spent even while its 5h/7d windows still have room.
@@ -112,7 +113,7 @@ For cron/systemd timers, `--once` reports the outcome in its exit code (`0` swit
 */5 * * * * cswap auto --once --json >> ~/.cswap-auto.log 2>&1
 ```
 
-Defaults like the threshold and cooldown are configurable with `cswap config set autoswitch.threshold 80` — flags override them (see [Configuration](#configuration)).
+Defaults like the threshold and cooldown are configurable with `cswap config set autoswitch.threshold 80` — flags override them (see [Configuration](#configuration)). To use separate limits, set `autoswitch.fiveHourThreshold` and `autoswitch.sevenDayThreshold`; selected per-model weekly limits use the seven-day threshold.
 
 </details>
 
@@ -185,6 +186,7 @@ cswap config                    # Show or edit settings (see Configuration below
 cswap list                      # Show all accounts with 5h/7d usage and reset times
 cswap list --token-status       # Add source-labelled OAuth token diagnostics
 cswap status                    # Show current account
+cswap refresh                   # Request fresh usage for every managed account
 cswap add --slot 3              # Add account to a specific slot (prompts before overwrite)
 cswap add --alias dev           # Add account and give it a short alias
 cswap remove 2                  # Remove an account
@@ -219,6 +221,7 @@ The original flag spellings (`cswap --switch`, `cswap --list`, ...) keep working
 - Switches (manual and automatic) hold Claude Code's own credential locks while writing, so a swap never interleaves with a token refresh
 - Auto-switch freshens a target's token before activating it, and quarantines accounts whose refresh token has died (recover by re-adding it with `cswap add --slot N`, or by replacing its stored credentials from a known-good export — a plain `cswap import backup.cswap` replaces dead-token slots automatically)
 - Usage numbers refresh every few minutes — faster for an account being used or close to switching, slower for idle ones — keeping cswap comfortably inside Anthropic's rate limits however many dashboards you keep open on a machine. An age note like `· 6m ago` just means the next scheduled check hasn't come yet, not that something is stuck.
+- `cswap refresh` requests current usage for every managed account without changing the active account. It bypasses the normal successful-cache TTL and future poll schedule, but still honors provider retry delays, dead-token quarantine, and another process's in-flight request. The command retrieves usage; it does not reset quota. Each account reports whether it refreshed, was deferred (with the retry time), is already in flight, or is unavailable.
 
 ## Data locations
 
@@ -271,6 +274,8 @@ Tool preferences live in `settings.json` in the backup root; `cswap config` read
 cswap config                              # list effective settings ("(default)" = not set)
 cswap config get autoswitch.threshold
 cswap config set autoswitch.threshold 80  # validated: rejects out-of-range values loudly
+cswap config set autoswitch.fiveHourThreshold 94
+cswap config set autoswitch.sevenDayThreshold 98  # also selected model weekly limits
 cswap config set autoswitch.model Fable   # per-model switching (see "auto"); Fable,Opus for several
 cswap config unset autoswitch.threshold   # back to the default
 cswap config path                         # where settings.json lives
@@ -298,11 +303,12 @@ If an imported account is the one you're currently logged in as, activate the im
 
 ### JSON output for scripting
 
-Add `--json` to `list`, `status`, or `switch` to emit a single machine-readable JSON object on stdout (human-readable notices go to stderr). Useful for scripting auto-swap and quota tracking.
+Add `--json` to `list`, `status`, `refresh`, or `switch` to emit a single machine-readable JSON object on stdout (human-readable notices go to stderr). Useful for scripting auto-swap and quota tracking.
 
 ```bash
 cswap list --json                   # all accounts with usage/quota
 cswap status --json                 # current active account
+cswap refresh --json                # fresh-usage outcome for every account
 cswap switch --strategy best --json # switch, then report the result
 cswap switch 2 --json
 ```
@@ -323,6 +329,8 @@ cswap switch 2 --json
 ```
 
 Every payload carries a `schemaVersion` (currently `1`); on a handled error stdout is `{"schemaVersion":1,"error":{...}}` with a non-zero exit code. `--switch`/`--switch-to` report `{"switched": true|false, "from": …, "to": …, "reason": …}`.
+
+`refresh --json` reports one row per managed account with `refreshStatus`: `refreshed`, `deferred`, `in_flight`, `superseded`, `unavailable`, or `error`, plus a stable `reason`. Successful rows carry `refreshedAt`, `usageStatus`, and the freshly retrieved `usage`; deferred and retryable error rows carry `retryAt`. A non-refreshed row with older data carries clearly labelled `lastGoodUsage`, `lastGoodFetchedAt`, and `lastGoodAgeSeconds` fields. These outcomes describe that command invocation, so an older cached measurement is never presented as freshly refreshed. `refresh` exits 0 when this best-effort pass completes, even if some accounts cannot refresh; a command-level failure exits 1.
 
 Usage is served from a per-account cache: when the usage API is briefly unreachable, the last-known numbers are shown instead of nothing (the human view marks them with their age, e.g. `· 2m ago`). Rows with decision-trusted usage carry additive `usageFetchedAt`/`usageAgeSeconds` fields telling you how old the measurement is. Whenever `usage` is null but a last-known measurement exists — data too old to drive a decision (`usageStatus` stays `unavailable`), or a row in a non-`ok` state such as `token_expired` — additive `lastGoodUsage`/`lastGoodFetchedAt`/`lastGoodAgeSeconds` fields preserve the human display without making the account actionable. These fields apply to list rows and the managed active row from `status --json`. An account held out of rotation with `cswap disable` carries an additive `"disabled": true` on its row (absent otherwise).
 
