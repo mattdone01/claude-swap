@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
@@ -361,8 +362,114 @@ def fresh_reset_strings(window: dict) -> tuple[str, str] | None:
     return None
 
 
+# Setup-tokens (`claude setup-token`) carry only the inference scope, so the
+# usage endpoint answers them 403. The same 5h/7d utilization rides back as
+# `anthropic-ratelimit-unified-*` headers on every Messages response, so a
+# 1-token request recovers it. Setup-tokens never rotate, which is what lets one
+# account be live on several machines at once without one machine's refresh
+# killing the other's copy.
+HEADER_PROBE_URL = "https://api.anthropic.com/v1/messages"
+HEADER_PROBE_MODEL = os.environ.get("CSWAP_PROBE_MODEL", "claude-haiku-4-5-20251001")
+_HEADER_WINDOWS = (("five_hour", "5h"), ("seven_day", "7d"))
+
+# Fingerprints of tokens the usage endpoint has refused with 403 this process:
+# go straight to the header probe for them instead of spending a 403 per poll.
+_header_probe_tokens: set[str] = set()
+
+
+def _token_fp(access_token: str) -> str:
+    return hashlib.sha256(access_token.encode()).hexdigest()[:16]
+
+
+def usage_from_ratelimit_headers(headers) -> dict | None:
+    """Raw usage-API-shaped dict from `anthropic-ratelimit-unified-*` headers.
+
+    Header utilization is a 0–1 fraction and resets are epoch seconds; the
+    usage API reports percent and ISO timestamps, so convert to match
+    :func:`build_usage_result`'s input. ``None`` when no window header is present.
+    """
+    if headers is None:
+        return None
+    data: dict = {}
+    for key, label in _HEADER_WINDOWS:
+        raw = headers.get(f"anthropic-ratelimit-unified-{label}-utilization")
+        if raw is None:
+            continue
+        try:
+            window: dict = {"utilization": round(float(raw) * 100, 1)}
+        except ValueError:
+            continue
+        reset = headers.get(f"anthropic-ratelimit-unified-{label}-reset")
+        if reset:
+            try:
+                window["resets_at"] = datetime.fromtimestamp(
+                    int(float(reset)), tz=timezone.utc
+                ).isoformat()
+            except (ValueError, OverflowError, OSError):
+                pass
+        data[key] = window
+    return data or None
+
+
+def request_usage_via_headers(access_token: str) -> dict:
+    """Recover utilization from a minimal Messages call's rate-limit headers.
+
+    A 429 from an exhausted account still carries the headers (that is the
+    reading that matters most), so it is parsed rather than raised; any
+    response without them re-raises so the caller's error classification and
+    backoff apply unchanged.
+    """
+    body = json.dumps({
+        "model": HEADER_PROBE_MODEL,
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "."}],
+    }).encode()
+    req = urllib.request.Request(
+        HEADER_PROBE_URL,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "anthropic-version": "2023-06-01",
+            "anthropic-beta": OAUTH_BETA_HEADER,
+            "content-type": "application/json",
+            "User-Agent": "claude-swap/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = usage_from_ratelimit_headers(resp.headers)
+    except urllib.error.HTTPError as e:
+        data = usage_from_ratelimit_headers(e.headers)
+        if data is None:
+            raise
+    if data is None:
+        raise json.JSONDecodeError("no rate-limit headers on probe response", "", 0)
+    return data
+
+
+def is_setup_token(oauth: dict | None) -> bool:
+    """A `claude setup-token` credential: inference scope only, no refresh token.
+
+    These never rotate and the usage endpoint can't read them, so their usage
+    always comes from the header probe (which also keeps them off the usage
+    endpoint's shared per-account request budget).
+    """
+    if not isinstance(oauth, dict) or oauth.get("refreshToken"):
+        return False
+    scopes = oauth.get("scopes") or ()
+    return "user:inference" in scopes and "user:profile" not in scopes
+
+
 def request_usage_data(access_token: str) -> dict:
-    """Request raw utilization data from the Anthropic usage API."""
+    """Request raw utilization data from the Anthropic usage API.
+
+    Falls back to :func:`request_usage_via_headers` when the endpoint refuses
+    the token with 403 (setup-tokens lack the scope it needs).
+    """
+    fp = _token_fp(access_token)
+    if fp in _header_probe_tokens:
+        return request_usage_via_headers(access_token)
     url = "https://api.anthropic.com/api/oauth/usage"
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -370,8 +477,16 @@ def request_usage_data(access_token: str) -> dict:
         "User-Agent": "claude-swap/1.0",
     }
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=5) as resp:
-        return json.loads(resp.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        if e.code != 403:
+            raise
+        _logger.info("Usage endpoint refused token (403); reading rate-limit headers instead")
+        data = request_usage_via_headers(access_token)
+        _header_probe_tokens.add(fp)
+        return data
 
 
 def _classify_usage_error(e: Exception) -> tuple[str, float | None]:
@@ -670,7 +785,10 @@ def try_fetch_usage_for_account(
         # the 401 path below retries the refresh.
 
     try:
-        data = request_usage_data(access_token)
+        if is_setup_token(oauth):
+            data = request_usage_via_headers(access_token)
+        else:
+            data = request_usage_data(access_token)
         return UsageOutcome(build_usage_result(data))
     except urllib.error.HTTPError as e:
         kind, retry_after = _classify_usage_error(e)
