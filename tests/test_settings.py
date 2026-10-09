@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from unittest.mock import patch
 
 from claude_swap.exceptions import ConfigError
 from claude_swap.settings import (
@@ -21,6 +22,7 @@ from claude_swap.settings import (
     load_ui_settings,
     merged_with_cli,
     save_settings,
+    set_global_threshold,
     set_setting,
     settings_path,
     unset_setting,
@@ -30,6 +32,8 @@ from claude_swap.settings import (
 def _args(**kwargs) -> argparse.Namespace:
     defaults = {
         "threshold": None,
+        "five_hour_threshold": None,
+        "seven_day_threshold": None,
         "interval": None,
         "cooldown": None,
         "include_api_key_accounts": None,
@@ -58,6 +62,18 @@ class TestLoadSettings:
         loaded = load_settings(tmp_path)
         assert loaded.threshold == 80.0
         assert loaded.interval_seconds == AutoSwitchSettings().interval_seconds
+
+    def test_per_window_thresholds_load_independently(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({
+            "autoswitch": {
+                "threshold": 90,
+                "fiveHourThreshold": 94,
+                "sevenDayThreshold": 98,
+            }
+        }))
+        loaded = load_settings(tmp_path)
+        assert loaded.five_hour_threshold == 94.0
+        assert loaded.seven_day_threshold == 98.0
 
     def test_values_are_clamped(self, tmp_path: Path):
         settings_path(tmp_path).write_text(json.dumps({
@@ -172,19 +188,72 @@ class TestSettingSpecs:
 
 class TestSetUnsetSetting:
     def test_set_writes_minimal_file(self, tmp_path: Path):
-        value = set_setting(tmp_path, "autoswitch.threshold", "80")
-        assert value == 80.0
+        value = set_setting(tmp_path, "autoswitch.threshold", "35")
+        assert value == 35.0
         raw = json.loads(settings_path(tmp_path).read_text())
-        assert raw == {"schemaVersion": 1, "autoswitch": {"threshold": 80.0}}
+        assert raw == {"schemaVersion": 1, "autoswitch": {"threshold": 35.0}}
+        assert load_settings(tmp_path).threshold == 35.0
+
+    @pytest.mark.parametrize(
+        ("key", "field"),
+        [
+            ("autoswitch.fiveHourThreshold", "five_hour_threshold"),
+            ("autoswitch.sevenDayThreshold", "seven_day_threshold"),
+        ],
+    )
+    def test_set_per_window_threshold(self, tmp_path: Path, key: str, field: str):
+        assert set_setting(tmp_path, key, "98") == 98.0
+        assert getattr(load_settings(tmp_path), field) == 98.0
+
+    def test_set_global_threshold_clears_window_overrides_in_one_write(
+        self, tmp_path: Path
+    ):
+        settings_path(tmp_path).write_text(json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {
+                "threshold": 90.0,
+                "fiveHourThreshold": 94.0,
+                "sevenDayThreshold": 98.0,
+                "futureKey": "kept",
+            },
+        }))
+
+        assert set_global_threshold(tmp_path, "80") == 80.0
+
+        section = json.loads(settings_path(tmp_path).read_text())["autoswitch"]
+        assert section == {"threshold": 80.0, "futureKey": "kept"}
+
+    def test_failed_global_threshold_write_preserves_split_policy(
+        self, tmp_path: Path
+    ):
+        original = json.dumps({
+            "autoswitch": {
+                "threshold": 90.0,
+                "fiveHourThreshold": 94.0,
+                "sevenDayThreshold": 98.0,
+            }
+        })
+        settings_path(tmp_path).write_text(original)
+
+        with patch(
+            "claude_swap.settings.atomic_write_json", side_effect=OSError("disk full")
+        ):
+            with pytest.raises(OSError, match="disk full"):
+                set_global_threshold(tmp_path, "80")
+
+        assert settings_path(tmp_path).read_text() == original
 
     def test_set_int_kind_coerces_and_rejects_floats(self, tmp_path: Path):
         assert set_setting(tmp_path, "autoswitch.unhealthyTicks", "5") == 5
         with pytest.raises(ConfigError, match="integer"):
             set_setting(tmp_path, "autoswitch.unhealthyTicks", "3.5")
 
-    def test_set_rejects_out_of_range_without_writing(self, tmp_path: Path):
-        with pytest.raises(ConfigError, match="between 50 and 99.9"):
-            set_setting(tmp_path, "autoswitch.threshold", "200")
+    @pytest.mark.parametrize("value", ["0", "100"])
+    def test_set_rejects_out_of_range_without_writing(
+        self, tmp_path: Path, value: str
+    ):
+        with pytest.raises(ConfigError, match="between 1 and 99.9"):
+            set_setting(tmp_path, "autoswitch.threshold", value)
         assert not settings_path(tmp_path).exists()
 
     def test_set_rejects_unknown_key(self, tmp_path: Path):
@@ -262,6 +331,26 @@ class TestMergedWithCli:
         assert merged.threshold == 60.0
         assert merged.interval_seconds == 30.0
         assert merged.cooldown_seconds == 10.0  # untouched
+
+    def test_legacy_cli_threshold_applies_globally(self):
+        base = AutoSwitchSettings(
+            threshold=90.0,
+            five_hour_threshold=94.0,
+            seven_day_threshold=98.0,
+        )
+        merged = merged_with_cli(base, _args(threshold=80.0))
+        assert merged.threshold == 80.0
+        assert merged.five_hour_threshold is None
+        assert merged.seven_day_threshold is None
+
+    def test_window_cli_threshold_refines_global_cli_threshold(self):
+        merged = merged_with_cli(
+            AutoSwitchSettings(five_hour_threshold=70.0),
+            _args(threshold=80.0, seven_day_threshold=98.0),
+        )
+        assert merged.threshold == 80.0
+        assert merged.five_hour_threshold is None
+        assert merged.seven_day_threshold == 98.0
 
     def test_cli_values_are_clamped(self):
         merged = merged_with_cli(AutoSwitchSettings(), _args(interval=1.0))

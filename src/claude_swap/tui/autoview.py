@@ -30,6 +30,8 @@ from claude_swap.autoswitch import (
     binding_pct,
     pct_label,
 )
+from claude_swap import oauth, poll_policy
+from claude_swap.poll_policy import WindowThresholds
 from claude_swap.models import AccountsSnapshot
 from claude_swap.settings import SETTING_SPECS, load_settings, parse_model_names
 from claude_swap.tui import data
@@ -85,6 +87,7 @@ class AutoScreen(Screen):
         # adjust mode was entered (wake/log only on a net change).
         self._adjusting = False
         self._configured_threshold: float | None = None
+        self._configured_bar_threshold: float | None = None
         self._entry_threshold: float | None = None
 
     def compose(self) -> ComposeResult:
@@ -107,7 +110,13 @@ class AutoScreen(Screen):
         # and remember that value: unmount restores it (only the session
         # adjustment reverts, not this correction).
         self._configured_threshold = self._settings.threshold
-        self.app.threshold_pct = self._settings.threshold
+        thresholds = WindowThresholds.from_settings(self._settings)
+        self._configured_bar_threshold = (
+            thresholds.five_hour
+            if thresholds.five_hour == thresholds.seven_day
+            else None
+        )
+        self.app.threshold_pct = self._configured_bar_threshold
         self._update_summary()
         self.watch(self.app, "snapshot", self._on_snapshot)
         self.watch(self.app, "theme", self._on_theme_change)
@@ -119,8 +128,7 @@ class AutoScreen(Screen):
         # A session threshold must not outlive the engine it steered: unpin
         # the poll planner and put the bar tick back on the file value.
         self.app.switcher.clear_poll_policy_inputs()
-        if self._configured_threshold is not None:
-            self.app.threshold_pct = self._configured_threshold
+        self.app.threshold_pct = self._configured_bar_threshold
         self.app.set_store_only(False)
 
     def _on_theme_change(self, _theme: str) -> None:
@@ -146,6 +154,19 @@ class AutoScreen(Screen):
     def action_adjust_threshold(self) -> None:
         if self._adjusting:
             self._end_adjust()
+            return
+        if (
+            self._settings.five_hour_threshold is not None
+            or self._settings.seven_day_threshold is not None
+        ):
+            self.query_one("#event-log", RichLog).write(
+                Text(
+                    "— per-window thresholds are configured; change them with "
+                    "`cswap config set autoswitch.fiveHourThreshold …` and "
+                    "`autoswitch.sevenDayThreshold …` —",
+                    style=Palette.from_theme(self.app.current_theme).muted,
+                )
+            )
             return
         self._adjusting = True
         self._entry_threshold = self._settings.threshold
@@ -182,7 +203,12 @@ class AutoScreen(Screen):
     def _set_threshold(self, value: float) -> None:
         if value == self._settings.threshold:
             return
-        self._settings = replace(self._settings, threshold=value)
+        self._settings = replace(
+            self._settings,
+            threshold=value,
+            five_hour_threshold=None,
+            seven_day_threshold=None,
+        )
         if self._engine is not None:
             self._engine.apply_threshold(value)
         self.app.threshold_pct = value
@@ -193,8 +219,17 @@ class AutoScreen(Screen):
         palette = Palette.from_theme(self.app.current_theme)
         text = Text()
         text.append("auto-switch · ")
+        thresholds = WindowThresholds.from_settings(self._settings)
+        threshold_label = (
+            f"threshold {pct_label(thresholds.five_hour)}%"
+            if thresholds.five_hour == thresholds.seven_day
+            else (
+                f"thresholds 5h {pct_label(thresholds.five_hour)}% / "
+                f"7d {pct_label(thresholds.seven_day)}%"
+            )
+        )
         text.append(
-            f"threshold {pct_label(self._settings.threshold)}%",
+            threshold_label,
             style=palette.accent if self._adjusting else "",
         )
         if self._settings.threshold != self._configured_threshold:
@@ -299,12 +334,17 @@ class AutoScreen(Screen):
         # displayed ranking can never disagree with the account it picks.
         palette = Palette.from_theme(self.app.current_theme)
         models = parse_model_names(self._settings.model) if self._settings else ()
-        ranked: list[tuple[float, str]] = []  # (sort key: pct used, number)
+        thresholds = WindowThresholds.from_settings(self._settings)
+        ranked: list[tuple[tuple[float, float], str]] = []
         lines: dict[str, Text] = {}
         for acc in snap.accounts:
             if acc.number == active_number or not acc.switchable:
                 continue
             pct = binding_pct(acc.usage.last_good, models)
+            runway = poll_policy.threshold_runway(
+                acc.usage.last_good, thresholds, models
+            )
+            headroom = oauth.account_headroom(acc.usage.last_good, models)
             entry = Text()
             entry.append(f"\n  {acc.number:>2}  ", style=palette.foreground)
             entry.append(acc.email, style=palette.foreground)
@@ -312,13 +352,15 @@ class AutoScreen(Screen):
                 entry.append(
                     f"  {data.sentinel_label(acc.usage.sentinel)}", style=palette.muted
                 )
-                ranked.append((998.0, acc.number))
-            elif pct is None:
+                ranked.append(((998.0, 998.0), acc.number))
+            elif pct is None or runway is None or headroom is None:
                 entry.append("  usage unknown", style=palette.muted)
-                ranked.append((999.0, acc.number))
+                ranked.append(((999.0, 999.0), acc.number))
             else:
                 entry.append(f"  {pct:3.0f}% used", style=palette.severity(pct))
-                ranked.append((pct, acc.number))
+                # Same ordering as the engine's default/best policy: configured
+                # runway first, raw headroom as the tie-break.
+                ranked.append(((-runway, -headroom), acc.number))
             lines[acc.number] = entry
 
         text = Text()
@@ -326,6 +368,6 @@ class AutoScreen(Screen):
         if not ranked:
             text.append("\n  no other switchable accounts", style=palette.muted)
             return text
-        for _pct, number in sorted(ranked):
+        for _key, number in sorted(ranked):
             text.append(lines[number])
         return text

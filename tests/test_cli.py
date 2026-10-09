@@ -1050,6 +1050,112 @@ class TestJsonOutputCli:
         assert envelope["error"] == {"type": "ConfigError", "message": "nope"}
         assert captured.err == ""  # nothing on stderr in JSON mode
 
+    def test_refresh_json_is_single_structured_result(self, capsys):
+        payload = {
+            "schemaVersion": 1,
+            "activeAccountNumber": 1,
+            "accounts": [
+                {
+                    "number": 1,
+                    "email": "a@example.com",
+                    "active": True,
+                    "refreshStatus": "refreshed",
+                    "refreshedAt": "2026-10-01T12:00:00Z",
+                    "usageStatus": "ok",
+                    "usage": {"fiveHour": {"pct": 11.0}},
+                }
+            ],
+        }
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(
+                 sys, "argv", ["claude-swap", "refresh", "--json"]
+             ), \
+             patch("os.geteuid", return_value=1000, create=True):
+            switcher_cls.return_value.refresh_usage.return_value = payload
+            cli.main()
+
+        switcher_cls.return_value.refresh_usage.assert_called_once_with()
+        assert json.loads(capsys.readouterr().out) == payload
+
+    def test_refresh_help_explains_safety_boundaries(self, capsys):
+        with patch.object(sys, "argv", ["claude-swap", "refresh", "--help"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+
+        assert excinfo.value.code == 0
+        output = " ".join(capsys.readouterr().out.split())
+        assert "does not reset quota" in output
+        assert "provider retry delays" in output
+        assert "does not change the active account" in output
+        assert "best-effort pass completes" in output
+
+    def test_refresh_human_distinguishes_no_windows_and_labels_cache(
+        self, capsys
+    ):
+        payload = {
+            "schemaVersion": 1,
+            "activeAccountNumber": 1,
+            "accounts": [
+                {
+                    "number": 1,
+                    "email": "a@example.com",
+                    "active": True,
+                    "refreshStatus": "refreshed",
+                    "reason": "no_usage_windows",
+                    "refreshedAt": "2026-10-01T12:00:00Z",
+                    "usageStatus": "unavailable",
+                    "usage": None,
+                },
+                {
+                    "number": 2,
+                    "email": "b@example.com",
+                    "active": False,
+                    "refreshStatus": "error",
+                    "reason": "timeout",
+                    "detail": "timeout",
+                    "retryAt": "2026-10-01T12:01:00Z",
+                    "lastGoodUsage": {"fiveHour": {"pct": 20.0}},
+                    "lastGoodFetchedAt": "2026-10-01T11:55:00Z",
+                    "lastGoodAgeSeconds": 300.0,
+                },
+            ],
+        }
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", "refresh"]), \
+             patch("os.geteuid", return_value=1000, create=True):
+            switcher_cls.return_value.refresh_usage.return_value = payload
+            cli.main()
+
+        output = capsys.readouterr().out
+        assert "no quota windows were returned" in output
+        assert "cached measurement from 2026-10-01T11:55:00Z, 300s old" in output
+
+    def test_refresh_per_account_failures_are_best_effort_exit_zero(self, capsys):
+        payload = {
+            "schemaVersion": 1,
+            "activeAccountNumber": None,
+            "accounts": [
+                {
+                    "number": 1,
+                    "email": "a@example.com",
+                    "active": False,
+                    "refreshStatus": "error",
+                    "reason": "timeout",
+                    "detail": "timeout",
+                    "retryAt": "2026-10-01T12:01:00Z",
+                }
+            ],
+        }
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(
+                 sys, "argv", ["claude-swap", "refresh", "--json"]
+             ), \
+             patch("os.geteuid", return_value=1000, create=True):
+            switcher_cls.return_value.refresh_usage.return_value = payload
+            cli.main()
+
+        assert json.loads(capsys.readouterr().out) == payload
+
 
 class TestAutoCommand:
     """`cswap auto` pre-dispatch: parsing, settings merge, exit codes, JSONL."""
@@ -1121,10 +1227,47 @@ class TestAutoCommand:
             "schemaVersion": 1,
             "autoswitch": {"threshold": 80.0, "cooldownSeconds": 42.0},
         }))
-        self._run(["--once", "--threshold", "60"], temp_home)
+        self._run(["--once", "--threshold", "35"], temp_home)
         engine = self.FakeEngine.instances[-1]
-        assert engine.settings.threshold == 60.0     # CLI wins
+        assert engine.settings.threshold == 35.0     # CLI wins without clamping
         assert engine.settings.cooldown_seconds == 42.0  # settings.json kept
+
+    def test_window_threshold_flags_override_settings(self, temp_home):
+        self._run(
+            [
+                "--once",
+                "--five-hour-threshold",
+                "94",
+                "--seven-day-threshold",
+                "98",
+                "--model",
+                "Fable",
+            ],
+            temp_home,
+        )
+        settings = self.FakeEngine.instances[-1].settings
+        assert settings.five_hour_threshold == 94.0
+        assert settings.seven_day_threshold == 98.0
+        assert settings.model == "Fable"
+
+    def test_legacy_threshold_flag_clears_persisted_window_overrides(
+        self, temp_home
+    ):
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        (backup / "settings.json").write_text(json.dumps({
+            "autoswitch": {
+                "fiveHourThreshold": 94.0,
+                "sevenDayThreshold": 98.0,
+            }
+        }))
+        self._run(["--once", "--threshold", "80"], temp_home)
+        settings = self.FakeEngine.instances[-1].settings
+        assert settings.threshold == 80.0
+        assert settings.five_hour_threshold is None
+        assert settings.seven_day_threshold is None
 
     def test_dry_run_forwarded(self, temp_home):
         self._run(["--once", "--dry-run"], temp_home)
@@ -1164,6 +1307,9 @@ class TestAutoCommand:
         assert excinfo.value.code == 0
         out = capsys.readouterr().out
         assert "--once" in out
+        assert "--five-hour-threshold" in out
+        assert "--seven-day-threshold" in out
+        assert "1-99.9; default 90" in out
         assert "Exit codes" in out
 
     def test_main_help_mentions_auto(self):

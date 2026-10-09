@@ -41,6 +41,8 @@ class TestConfigList:
         assert code == 0
         for key in (
             "autoswitch.threshold",
+            "autoswitch.fiveHourThreshold",
+            "autoswitch.sevenDayThreshold",
             "autoswitch.intervalSeconds",
             "autoswitch.cooldownSeconds",
             "autoswitch.hysteresisPct",
@@ -51,7 +53,7 @@ class TestConfigList:
             "ui.theme",
         ):
             assert key in out
-        assert out.count("(default)") == 9
+        assert out.count("(default)") == 11
 
     def test_set_key_not_marked_default(self, temp_home, capsys):
         _run(["set", "autoswitch.cooldownSeconds", "600"], capsys)
@@ -78,7 +80,7 @@ class TestConfigList:
         assert payload["schemaVersion"] == 1
         assert payload["path"].endswith("settings.json")
         by_key = {entry["key"]: entry for entry in payload["settings"]}
-        assert len(by_key) == 9
+        assert len(by_key) == 11
         assert by_key["autoswitch.threshold"]["value"] == 90.0
         assert by_key["autoswitch.threshold"]["isSet"] is False
         assert by_key["autoswitch.includeApiKeyAccounts"]["value"] is False
@@ -143,10 +145,13 @@ class TestConfigSetGet:
 
 
 class TestConfigValidation:
-    def test_out_of_range_exits_1(self, temp_home, capsys):
-        code, _, err = _run(["set", "autoswitch.threshold", "30"], capsys)
+    @pytest.mark.parametrize("value", ["0", "100"])
+    def test_out_of_range_exits_1(self, temp_home, capsys, value):
+        code, _, err = _run(
+            ["set", "autoswitch.threshold", value], capsys
+        )
         assert code == 1
-        assert "between 50 and 99.9" in err
+        assert "between 1 and 99.9" in err
 
     def test_unknown_key_exits_1_and_lists_valid_keys(self, temp_home, capsys):
         code, _, err = _run(["set", "autoswitch.bogus", "1"], capsys)

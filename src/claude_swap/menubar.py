@@ -30,6 +30,7 @@ from pathlib import Path
 
 from claude_swap import pace
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
+from claude_swap.poll_policy import WindowThresholds
 from claude_swap.printer import warning
 from claude_swap.switcher import SENTINEL_NOTES
 
@@ -39,6 +40,24 @@ AUTO_THRESHOLD_CHOICES: tuple[int, ...] = (80, 90, 95, 98)
 TITLE_PCT_CHOICES: tuple[str, ...] = ("off", "5h", "7d", "both")
 SWITCH_HISTORY_LIMIT = 10
 NOTIFICATION_BUNDLE_ID = "com.claude-swap.menubar"
+
+
+def auto_threshold_menu_state(settings) -> tuple[int | None, str | None]:
+    """Checked scalar preset and optional effective custom-policy label."""
+    thresholds = WindowThresholds.from_settings(settings)
+    if (
+        thresholds.five_hour == thresholds.seven_day
+        and thresholds.five_hour in AUTO_THRESHOLD_CHOICES
+    ):
+        return int(thresholds.five_hour), None
+    if thresholds.five_hour == thresholds.seven_day:
+        label = f"Custom: {thresholds.five_hour:g}%"
+    else:
+        label = (
+            f"Custom: 5h {thresholds.five_hour:g}% / "
+            f"7d {thresholds.seven_day:g}%"
+        )
+    return None, label
 
 
 def ensure_notification_identity(
@@ -548,7 +567,7 @@ def run(switcher) -> int:
     )
 
     from claude_swap.autoswitch import AutoSwitchEngine
-    from claude_swap.settings import load_settings, set_setting
+    from claude_swap.settings import load_settings, set_global_threshold
     from claude_swap.snapshot_source import SnapshotSource
 
     settings_path = switcher.backup_dir / "menubar_settings.json"
@@ -724,12 +743,14 @@ def run(switcher) -> int:
                     # menu-bar user with a silently inert filter.
                     rumps.notification("claude-swap", "Configuration warning", ev.human())
 
-        def _threshold(self) -> int:
-            """Current auto-switch threshold from core settings (for the menu)."""
+        def _threshold_state(self) -> tuple[int | None, str | None]:
+            """Effective policy represented in the scalar threshold menu."""
             try:
-                return int(load_settings(self.switcher.backup_dir).threshold)
+                return auto_threshold_menu_state(
+                    load_settings(self.switcher.backup_dir)
+                )
             except Exception:
-                return 0
+                return None, "Custom policy unavailable"
 
         # ---- menu construction -----------------------------------------------
         def rebuild_menu(self):
@@ -873,7 +894,11 @@ def run(switcher) -> int:
             menu.add(auto_item)
 
             threshold_menu = rumps.MenuItem("Auto-switch threshold")
-            current = self._threshold()
+            current, custom = self._threshold_state()
+            if custom is not None:
+                custom_item = rumps.MenuItem(custom, callback=None)
+                custom_item.state = 1
+                threshold_menu.add(custom_item)
             for pct in AUTO_THRESHOLD_CHOICES:
                 ch = rumps.MenuItem(f"{pct}%", callback=self._make_threshold(pct))
                 ch.state = 1 if current == pct else 0
@@ -1044,7 +1069,7 @@ def run(switcher) -> int:
         def _make_threshold(self, pct):
             def cb(_sender):
                 try:
-                    set_setting(self.switcher.backup_dir, "autoswitch.threshold", str(pct))
+                    set_global_threshold(self.switcher.backup_dir, str(pct))
                 except Exception as e:
                     rumps.alert(title="claude-swap", message=f"Couldn't set threshold: {e}")
                     return

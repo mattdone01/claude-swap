@@ -3449,6 +3449,74 @@ class TestPerformSwitchPostDisplay:
             p.start()
         return patches
 
+    def test_activation_waits_for_target_refresh_successor(
+        self,
+        temp_home: Path,
+        mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """A switch cannot install a target grant while refresh consumes it."""
+        import threading
+
+        from claude_swap.locking import FileLock
+
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data
+        )
+        old = creds_store[("2", "account2@example.com")]
+        successor = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-successor-2",
+                "refreshToken": "rt-successor-2",
+                "expiresAt": 9_999_999_999_000,
+            }
+        })
+        live_state = {"creds": json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-live-1",
+                "refreshToken": "rt-live-1",
+            }
+        })}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state
+        )
+        done = threading.Event()
+        errors: list[BaseException] = []
+
+        def activate() -> None:
+            try:
+                switcher._perform_switch(
+                    "2", emit_output=False, force_activate=True
+                )
+            except BaseException as exc:  # captured for assertion in main thread
+                errors.append(exc)
+            finally:
+                done.set()
+
+        consume_lock = FileLock(
+            switcher.credentials_dir / ".consume-2.lock"
+        )
+        try:
+            with consume_lock:
+                thread = threading.Thread(target=activate)
+                thread.start()
+                assert not done.wait(timeout=0.2), (
+                    "activation bypassed the target consume lock and could "
+                    "install the grant being consumed"
+                )
+                assert live_state["creds"] != old
+                # The paused refresh POST completed and persisted its successor
+                # before releasing the same lock activation is waiting on.
+                creds_store[("2", "account2@example.com")] = successor
+            assert done.wait(timeout=5)
+            thread.join(timeout=1)
+        finally:
+            for patcher in patches:
+                patcher.stop()
+
+        assert errors == []
+        assert live_state["creds"] == successor
+
     def test_switch_persists_rotated_refresh_token_to_backup(
         self,
         temp_home: Path,
@@ -4398,6 +4466,429 @@ class TestDeadTokenQuarantine:
             switcher.add_account()
 
         assert not switcher._usage_store.entries({"1": identity})["1"].token_dead()
+
+
+class TestManualUsageRefresh:
+    @staticmethod
+    def _credentials() -> str:
+        return json.dumps(
+            {
+                "claudeAiOauth": {
+                    "accessToken": "access",
+                    "refreshToken": "refresh",
+                    "expiresAt": 9_999_999_999_000,
+                }
+            }
+        )
+
+    def test_refresh_bypasses_cache_and_plan_and_reports_fetch_outcomes(
+        self, temp_home
+    ):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        infos = [
+            (1, "a@example.com", "", "org-a", True, self._credentials(), ""),
+            (2, "b@example.com", "", "org-b", False, self._credentials(), ""),
+        ]
+        identities = {
+            "1": ("a@example.com", "org-a"),
+            "2": ("b@example.com", "org-b"),
+        }
+        switcher._usage_store.record(
+            {
+                "1": FetchRecord(usage={"five_hour": {"pct": 1.0}}),
+                "2": FetchRecord(usage={"five_hour": {"pct": 2.0}}),
+            },
+            identities,
+        )
+        now = switcher._usage_store.clock()
+        switcher._usage_store.set_poll_plan(
+            {"1": (now + 600.0, 600.0), "2": (now + 600.0, 600.0)},
+            identities,
+        )
+
+        with patch.object(switcher, "_build_accounts_info", return_value=infos), \
+             patch.object(
+                 switcher,
+                 "_run_usage_fetches",
+                 return_value={
+                     "1": FetchRecord(usage={"five_hour": {"pct": 11.0}}),
+                     "2": FetchRecord(error="timeout"),
+                 },
+             ) as fetches, \
+             patch.object(switcher, "_perform_switch") as perform_switch:
+            payload = switcher.refresh_usage()
+
+        assert {str(info[0]) for info in fetches.call_args.args[0]} == {"1", "2"}
+        by_number = {row["number"]: row for row in payload["accounts"]}
+        assert by_number[1]["refreshStatus"] == "refreshed"
+        assert by_number[1]["reason"] == "fresh_usage"
+        assert by_number[1]["refreshedAt"]
+        assert by_number[1]["usageStatus"] == "ok"
+        assert by_number[1]["usage"]["fiveHour"]["pct"] == 11.0
+        assert by_number[2]["refreshStatus"] == "error"
+        assert by_number[2]["reason"] == "timeout"
+        assert by_number[2]["detail"] == "timeout"
+        assert by_number[2]["retryAt"]
+        assert by_number[2]["lastGoodUsage"]["fiveHour"]["pct"] == 2.0
+        assert by_number[2]["lastGoodFetchedAt"]
+        assert by_number[2]["lastGoodAgeSeconds"] >= 0
+        assert payload["activeAccountNumber"] == 1
+        perform_switch.assert_not_called()
+
+    def test_refresh_reports_backoff_and_concurrent_claim_without_fetching(
+        self, temp_home
+    ):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        infos = [
+            (1, "a@example.com", "", "org-a", False, self._credentials(), ""),
+            (2, "b@example.com", "", "org-b", False, self._credentials(), ""),
+        ]
+        identities = {
+            "1": ("a@example.com", "org-a"),
+            "2": ("b@example.com", "org-b"),
+        }
+        switcher._usage_store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=300.0)},
+            identities,
+        )
+        switcher._usage_store.claim(["2"], identities)
+
+        with patch.object(switcher, "_build_accounts_info", return_value=infos), \
+             patch.object(switcher, "_run_usage_fetches") as fetches:
+            payload = switcher.refresh_usage()
+
+        fetches.assert_not_called()
+        by_number = {row["number"]: row for row in payload["accounts"]}
+        assert by_number[1]["refreshStatus"] == "deferred"
+        assert by_number[1]["reason"] == "backoff"
+        assert by_number[1]["retryAt"]
+        assert by_number[2]["refreshStatus"] == "in_flight"
+        assert by_number[2]["reason"] == "claim_active"
+
+    def test_static_unavailability_outranks_stored_backoff(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        identity = {"1": ("a@example.com", "org-a")}
+        switcher._usage_store.record(
+            {"1": FetchRecord(error="timeout")}, identity
+        )
+        infos = [(1, "a@example.com", "", "org-a", False, "", "")]
+
+        with patch.object(switcher, "_build_accounts_info", return_value=infos), \
+             patch.object(switcher, "_run_usage_fetches") as fetches:
+            row = switcher.refresh_usage()["accounts"][0]
+
+        fetches.assert_not_called()
+        assert row["refreshStatus"] == "unavailable"
+        assert row["reason"] == "no_credentials"
+        assert "retryAt" not in row
+
+    def test_active_token_overlay_does_not_hide_live_claim(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        expired = json.dumps(
+            {
+                "claudeAiOauth": {
+                    "accessToken": "access",
+                    "refreshToken": "refresh",
+                    "expiresAt": 1,
+                }
+            }
+        )
+        identity = {"1": ("a@example.com", "org-a")}
+        switcher._usage_store.claim(["1"], identity)
+        infos = [(1, "a@example.com", "", "org-a", True, expired, "")]
+
+        with patch.object(switcher, "_build_accounts_info", return_value=infos), \
+             patch.object(switcher, "_run_usage_fetches") as fetches:
+            row = switcher.refresh_usage()["accounts"][0]
+
+        fetches.assert_not_called()
+        assert row["refreshStatus"] == "in_flight"
+        assert row["reason"] == "claim_active"
+
+    def test_existing_and_new_quarantine_have_same_result(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        identities = {
+            "1": ("a@example.com", "org-a"),
+            "2": ("b@example.com", "org-b"),
+        }
+        switcher._usage_store.record(
+            {"1": FetchRecord(error="invalid_grant")}, identities
+        )
+        infos = [
+            (1, "a@example.com", "", "org-a", False, self._credentials(), ""),
+            (2, "b@example.com", "", "org-b", False, self._credentials(), ""),
+        ]
+
+        with patch.object(switcher, "_build_accounts_info", return_value=infos), \
+             patch.object(
+                 switcher,
+                 "_run_usage_fetches",
+                 return_value={"2": FetchRecord(error="invalid_grant")},
+             ):
+            rows = switcher.refresh_usage()["accounts"]
+
+        assert [row["refreshStatus"] for row in rows] == [
+            "unavailable",
+            "unavailable",
+        ]
+        assert [row["reason"] for row in rows] == [
+            "relogin_required",
+            "relogin_required",
+        ]
+
+    def test_success_uses_its_atomic_commit_timestamp_after_later_write(
+        self, temp_home
+    ):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        clock = [1_000_000.0]
+        switcher._usage_store.clock = lambda: clock[0]
+        identity = {"1": ("a@example.com", "org-a")}
+        infos = [
+            (1, "a@example.com", "", "org-a", False, self._credentials(), "")
+        ]
+        real_entries = switcher._usage_store.entries
+        reads = 0
+
+        def concurrent_entries(*args, **kwargs):
+            nonlocal reads
+            reads += 1
+            if reads == 2:
+                clock[0] = 2_000_000.0
+                switcher._usage_store.record(
+                    {"1": FetchRecord(usage={"five_hour": {"pct": 99.0}})},
+                    identity,
+                )
+            return real_entries(*args, **kwargs)
+
+        with patch.object(switcher, "_build_accounts_info", return_value=infos), \
+             patch.object(
+                 switcher,
+                 "_run_usage_fetches",
+                 return_value={
+                     "1": FetchRecord(usage={"five_hour": {"pct": 11.0}})
+                 },
+             ), \
+             patch.object(
+                 switcher._usage_store, "entries", side_effect=concurrent_entries
+             ):
+            row = switcher.refresh_usage()["accounts"][0]
+
+        assert row["usage"]["fiveHour"]["pct"] == 11.0
+        assert row["refreshedAt"] == "1970-01-12T13:46:40Z"
+        assert real_entries(identity)["1"].last_good["five_hour"]["pct"] == 99.0
+
+    def test_lost_claim_is_reported_as_superseded(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        identity = {"1": ("a@example.com", "org-a")}
+        infos = [
+            (1, "a@example.com", "", "org-a", False, self._credentials(), "")
+        ]
+        real_record = switcher._usage_store.record
+
+        def supersede(_outcomes, identities, _claims, _plans, _commits):
+            switcher._usage_store.clear_dead_token(["1"], identities)
+            real_record(
+                {"1": FetchRecord(usage={"five_hour": {"pct": 88.0}})},
+                identities,
+            )
+            return set()
+
+        with patch.object(switcher, "_build_accounts_info", return_value=infos), \
+             patch.object(
+                 switcher,
+                 "_run_usage_fetches",
+                 return_value={
+                     "1": FetchRecord(usage={"five_hour": {"pct": 11.0}})
+                 },
+             ), \
+             patch.object(switcher._usage_store, "record", side_effect=supersede):
+            row = switcher.refresh_usage()["accounts"][0]
+
+        assert row["refreshStatus"] == "superseded"
+        assert row["reason"] == "claim_superseded"
+        assert row["lastGoodUsage"]["fiveHour"]["pct"] == 88.0
+
+    def test_lost_claim_stays_superseded_when_winner_records_429(
+        self, temp_home
+    ):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        infos = [
+            (1, "a@example.com", "", "org-a", False, self._credentials(), "")
+        ]
+        real_record = switcher._usage_store.record
+
+        def supersede(_outcomes, identities, _claims, _plans, _commits):
+            switcher._usage_store.clear_dead_token(["1"], identities)
+            real_record(
+                {"1": FetchRecord(error="http-429", retry_after_s=300.0)},
+                identities,
+            )
+            return set()
+
+        with patch.object(switcher, "_build_accounts_info", return_value=infos), \
+             patch.object(
+                 switcher,
+                 "_run_usage_fetches",
+                 return_value={
+                     "1": FetchRecord(usage={"five_hour": {"pct": 11.0}})
+                 },
+             ), \
+             patch.object(switcher._usage_store, "record", side_effect=supersede):
+            row = switcher.refresh_usage()["accounts"][0]
+
+        assert row["refreshStatus"] == "superseded"
+        assert row["reason"] == "claim_superseded"
+        assert row["retryAt"]
+
+    def test_rejection_snapshot_survives_expiry_during_and_after_chunk(
+        self, temp_home
+    ):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        clock = [1_000_000.0]
+        switcher._usage_store.clock = lambda: clock[0]
+        infos = [
+            (
+                number,
+                f"account{number}@example.com",
+                "",
+                f"org-{number}",
+                number == 2,
+                (
+                    json.dumps(
+                        {
+                            "claudeAiOauth": {
+                                "accessToken": "access",
+                                "refreshToken": "refresh",
+                                "expiresAt": 1,
+                            }
+                        }
+                    )
+                    if number == 2
+                    else self._credentials()
+                ),
+                "",
+            )
+            for number in range(1, 11)
+        ]
+        identities = {
+            str(number): (f"account{number}@example.com", f"org-{number}")
+            for number in range(1, 11)
+        }
+        switcher._usage_store.record(
+            {"1": FetchRecord(usage={"five_hour": {"pct": 20.0}})},
+            identities,
+        )
+        switcher._usage_store.record(
+            {"1": FetchRecord(error="timeout")}, identities
+        )
+        switcher._usage_store.claim(["2"], identities)
+        batches = 0
+
+        def fetched(batch, entries=None):
+            nonlocal batches
+            batches += 1
+            if batches == 1:
+                # Expires both the 30s backoff and 90s claim before this
+                # chunk returns; a later chunk then runs at the newer time.
+                clock[0] += 100.0
+            return {
+                str(info[0]): FetchRecord(usage={"five_hour": {"pct": 1.0}})
+                for info in batch
+            }
+
+        with patch.object(switcher, "_build_accounts_info", return_value=infos), \
+             patch.object(switcher, "_run_usage_fetches", side_effect=fetched):
+            rows = switcher.refresh_usage()["accounts"]
+
+        by_number = {row["number"]: row for row in rows}
+        assert batches == 2
+        assert by_number[1]["refreshStatus"] == "deferred"
+        assert by_number[1]["reason"] == "backoff"
+        assert by_number[1]["retryAt"] == "1970-01-12T13:47:10Z"
+        assert by_number[1]["lastGoodAgeSeconds"] == 100.0
+        assert by_number[2]["refreshStatus"] == "in_flight"
+        assert by_number[2]["reason"] == "claim_active"
+        assert by_number[2]["claimUntil"] == "1970-01-12T13:48:10Z"
+
+    def test_large_inventory_is_claimed_and_fetched_in_bounded_chunks(
+        self, temp_home
+    ):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        infos = [
+            (
+                number,
+                f"account{number}@example.com",
+                "",
+                f"org-{number}",
+                number == 1,
+                self._credentials(),
+                "",
+            )
+            for number in range(1, 18)
+        ]
+        batch_sizes: list[int] = []
+
+        def fetched(batch, entries=None):
+            batch_sizes.append(len(batch))
+            return {
+                str(info[0]): FetchRecord(usage={"five_hour": {"pct": 1.0}})
+                for info in batch
+            }
+
+        with patch.object(switcher, "_build_accounts_info", return_value=infos), \
+             patch.object(switcher, "_run_usage_fetches", side_effect=fetched):
+            payload = switcher.refresh_usage()
+
+        assert batch_sizes == [8, 8, 1]
+        assert len(payload["accounts"]) == 17
+        assert {row["refreshStatus"] for row in payload["accounts"]} == {
+            "refreshed"
+        }
+
+    def test_empty_inventory_and_disabled_account_are_included(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        with patch.object(switcher, "_build_accounts_info", return_value=[]):
+            assert switcher.refresh_usage()["accounts"] == []
+
+        data = {
+            "sequence": [1],
+            "accounts": {
+                "1": {
+                    "email": "a@example.com",
+                    "organizationUuid": "org-a",
+                    "disabled": True,
+                }
+            },
+        }
+        switcher._write_json(switcher.sequence_file, data)
+        with patch.object(switcher, "_get_current_account", return_value=None), \
+             patch.object(
+                 switcher,
+                 "_read_account_credentials",
+                 return_value=self._credentials(),
+             ), \
+             patch.object(
+                 switcher,
+                 "_run_usage_fetches",
+                 return_value={
+                     "1": FetchRecord(usage={"five_hour": {"pct": 1.0}})
+                 },
+             ):
+            payload = switcher.refresh_usage()
+
+        assert [row["number"] for row in payload["accounts"]] == [1]
+        assert payload["accounts"][0]["refreshStatus"] == "refreshed"
 
 
 class TestAddAccountOrgFields:

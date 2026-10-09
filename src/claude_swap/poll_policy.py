@@ -63,8 +63,10 @@ module only.
 
 from __future__ import annotations
 
+import math
 import random
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
 
 from claude_swap import oauth
@@ -147,6 +149,70 @@ ESCALATION_MARGIN_PCT = 15.0
 RESET_SLACK_S = 60.0
 
 
+@dataclass(frozen=True)
+class WindowThresholds:
+    """Effective proactive thresholds for account and scoped windows.
+
+    Per-model scoped limits are weekly, so they intentionally share the
+    seven-day threshold. The legacy global threshold remains the fallback for
+    either window when its optional override is unset.
+    """
+
+    five_hour: float
+    seven_day: float
+
+    @classmethod
+    def from_settings(cls, settings) -> "WindowThresholds":
+        return cls(
+            five_hour=(
+                settings.five_hour_threshold
+                if settings.five_hour_threshold is not None
+                else settings.threshold
+            ),
+            seven_day=(
+                settings.seven_day_threshold
+                if settings.seven_day_threshold is not None
+                else settings.threshold
+            ),
+        )
+
+    def for_window(self, label: str) -> float:
+        return self.five_hour if label == "5h" else self.seven_day
+
+    def as_dict(self) -> dict[str, float]:
+        return {"fiveHour": self.five_hour, "sevenDay": self.seven_day}
+
+
+def threshold_runway(
+    usage: dict | None,
+    thresholds: WindowThresholds,
+    models: tuple[str, ...] = (),
+) -> float | None:
+    """Smallest percentage-point runway to any selected switch threshold.
+
+    Zero is exactly at a proactive boundary; a negative value is over it.
+    Every selected window must be finite so corrupt telemetry cannot look
+    healthy merely because another window has a usable value.
+    """
+    windows = oauth.relevant_windows(usage, models)
+    if not windows:
+        return None
+    values = [thresholds.for_window(label) - pct for label, pct, _ in windows]
+    if any(not math.isfinite(value) for value in values):
+        return None
+    return min(values)
+
+
+def decision_pct(
+    usage: dict | None,
+    thresholds: WindowThresholds,
+    models: tuple[str, ...] = (),
+) -> float | None:
+    """Threshold-normalized utilization: 100 is the proactive boundary."""
+    runway = threshold_runway(usage, thresholds, models)
+    return None if runway is None else 100.0 - runway
+
+
 def binding_pct(usage: dict | None, models: tuple[str, ...] = ()) -> float | None:
     """Utilization of the binding (worst) relevant window, or None."""
     headroom = oauth.account_headroom(usage, models)
@@ -203,6 +269,7 @@ def plan_after_fetch(
     recent_429: bool,
     now: float,
     rng: Callable[[], float] = random.random,
+    thresholds: WindowThresholds | None = None,
 ) -> tuple[float, float]:
     """``(next_poll_at, interval_s)`` for an account just fetched successfully.
 
@@ -221,8 +288,9 @@ def plan_after_fetch(
     default = MIN_INTERVAL_S if is_active else CANDIDATE_DEFAULT_INTERVAL_S
     ceiling = ACTIVE_MAX_INTERVAL_S if is_active else CANDIDATE_MAX_INTERVAL_S
     base = prev_interval_s or default
-    prev_pct = binding_pct(prev_usage, models)
-    new_pct = binding_pct(new_usage, models)
+    effective_thresholds = thresholds or WindowThresholds(threshold, threshold)
+    prev_pct = decision_pct(prev_usage, effective_thresholds, models)
+    new_pct = decision_pct(new_usage, effective_thresholds, models)
     if prev_pct is None or new_pct is None:
         moving = False
         interval = default
@@ -240,7 +308,7 @@ def plan_after_fetch(
         and moving
         and not recent_429
         and new_pct is not None
-        and new_pct >= threshold - ESCALATION_MARGIN_PCT
+        and new_pct >= 100.0 - ESCALATION_MARGIN_PCT
     ):
         interval = URGENT_INTERVAL_S
     if recent_429:

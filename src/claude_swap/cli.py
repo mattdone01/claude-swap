@@ -498,6 +498,94 @@ Examples:
         sys.exit(130)
 
 
+def _refresh_command(argv: list[str]) -> None:
+    """Handle ``cswap refresh`` without routing through the legacy flag parser."""
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} refresh",
+        description=(
+            "Request fresh usage for every managed account. This bypasses "
+            "the normal successful-cache TTL and poll schedule, but keeps "
+            "provider retry delays, dead-token quarantine, and in-flight "
+            "request locks. It retrieves usage; it does not reset quota. "
+            "It does not change the active account."
+        ),
+        epilog=(
+            "Exit status is 0 when the best-effort pass completes, even if "
+            "individual accounts are deferred or unavailable; command-level "
+            "failures exit 1."
+        ),
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit one machine-readable result object to stdout",
+    )
+    args = parser.parse_args(argv)
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        payload = switcher.refresh_usage()
+    except ClaudeSwitchError as exc:
+        if args.json:
+            print(json.dumps(error_envelope(exc), indent=2))
+        else:
+            error(f"Error: {exc}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(
+            f"\n{dimmed('Operation cancelled')}",
+            file=sys.stderr if args.json else sys.stdout,
+        )
+        sys.exit(130)
+
+    if args.json:
+        print(json.dumps(payload, indent=2))
+        return
+
+    accounts = payload["accounts"]
+    if not accounts:
+        print(dimmed("No managed accounts."))
+        return
+    for row in accounts:
+        prefix = f"Account-{row['number']} ({row['email']})"
+        status = row["refreshStatus"]
+        cached = ""
+        if row.get("lastGoodFetchedAt") is not None:
+            age = row.get("lastGoodAgeSeconds")
+            age_note = f", {age:.0f}s old" if isinstance(age, (int, float)) else ""
+            cached = (
+                f"; cached measurement from {row['lastGoodFetchedAt']}"
+                f"{age_note}"
+            )
+        if status == "refreshed":
+            if row.get("usageStatus") == "ok":
+                print(f"{prefix}: refreshed at {row['refreshedAt']}")
+            else:
+                print(
+                    f"{prefix}: request succeeded at {row['refreshedAt']}, "
+                    "but no quota windows were returned"
+                )
+        elif status == "deferred":
+            print(
+                f"{prefix}: deferred until {row['retryAt']} "
+                f"({row['detail']}){cached}"
+            )
+        elif status == "in_flight":
+            print(f"{prefix}: in flight ({row['detail']}){cached}")
+        elif status == "error" and row.get("retryAt"):
+            print(
+                f"{prefix}: error ({row['detail']}); "
+                f"retry after {row['retryAt']}{cached}"
+            )
+        else:
+            print(
+                f"{prefix}: {status.replace('_', ' ')} "
+                f"({row['detail']}){cached}"
+            )
+
+
 def _alias_command(argv: list[str]) -> None:
     """Handle `cswap alias [NUM|EMAIL] [NAME] [--unset]`.
 
@@ -604,6 +692,7 @@ Exit codes with --once:
 Examples:
   cswap auto                       # foreground loop, switch at 90%% used
   cswap auto --threshold 80        # switch earlier
+  cswap auto --five-hour-threshold 94 --seven-day-threshold 98
   cswap auto --model Fable         # also switch when the Fable weekly limit is hit
   cswap auto --json                # one JSON event per line (for scripts)
   cswap auto --once; echo $?       # single tick, outcome in exit code
@@ -634,7 +723,25 @@ Defaults live in settings.json in the backup root; flags override them.
         metavar="PCT",
         help=(
             "Switch when the active account's binding 5h/7d window reaches "
-            "this utilization (50-99.9; default 90)"
+            "this utilization (1-99.9; default 90)"
+        ),
+    )
+    parser.add_argument(
+        "--five-hour-threshold",
+        type=float,
+        metavar="PCT",
+        help=(
+            "Override the 5-hour switch threshold (1-99.9); otherwise use "
+            "--threshold or autoswitch.threshold"
+        ),
+    )
+    parser.add_argument(
+        "--seven-day-threshold",
+        type=float,
+        metavar="PCT",
+        help=(
+            "Override the 7-day and selected per-model weekly switch threshold "
+            "(1-99.9); otherwise use --threshold or autoswitch.threshold"
         ),
     )
     parser.add_argument(
@@ -723,9 +830,20 @@ Defaults live in settings.json in the backup root; flags override them.
         # Loop mode: SIGTERM (systemd stop) exits the loop cleanly.
         signal.signal(signal.SIGTERM, lambda *_: engine.stop())
         if not args.json:
+            five_threshold = (
+                settings.five_hour_threshold
+                if settings.five_hour_threshold is not None
+                else settings.threshold
+            )
+            seven_threshold = (
+                settings.seven_day_threshold
+                if settings.seven_day_threshold is not None
+                else settings.threshold
+            )
             print(
                 dimmed(
-                    f"Auto-switch running: threshold {settings.threshold:.0f}%, "
+                    "Auto-switch running: thresholds "
+                    f"5h {five_threshold:g}% / 7d {seven_threshold:g}%, "
                     f"every {settings.interval_seconds:.0f}s"
                     f"{' (dry-run)' if args.dry_run else ''} — Ctrl-C to stop"
                 )
@@ -996,6 +1114,9 @@ def main() -> None:
     if argv and argv[0] == "auto":
         _auto_command(argv[1:])
         return  # only reachable in tests where sys.exit is mocked
+    if argv and argv[0] == "refresh":
+        _refresh_command(argv[1:])
+        return
     if len(sys.argv) > 1 and sys.argv[1] == "config":
         _config_command(sys.argv[2:])
         return
@@ -1038,6 +1159,7 @@ Commands:
   %(prog)s help                       show this help
   %(prog)s list                       list managed accounts
   %(prog)s status                     show current account
+  %(prog)s refresh                    fetch current usage for every account
   %(prog)s switch                     rotate to the next account
   %(prog)s switch <num|email>         switch to a specific account
   %(prog)s add                        add the current account
@@ -1075,6 +1197,7 @@ Aliases: ls=list  rm=remove  update=upgrade""",
   %(prog)s switch user@example.com
   %(prog)s list --token-status
   %(prog)s list --json
+  %(prog)s refresh --json
   %(prog)s add --slot 3                      # add to a specific slot
   %(prog)s add-token sk-ant-oat01-... --email me@example.com
   %(prog)s run 2 -- --resume                 # forward args after '--' to claude

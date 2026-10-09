@@ -1448,6 +1448,38 @@ class TestAutoScreen:
 
             assert isinstance(app.screen, DashboardScreen)
 
+    @pytest.mark.parametrize(
+        ("five_hour", "seven_day", "bar_threshold"),
+        [(94.0, 98.0, None), (94.0, 94.0, 94.0)],
+    )
+    async def test_window_overrides_disable_scalar_session_adjustment(
+        self, tmp_path, fake_engine, five_hour, seven_day, bar_threshold
+    ):
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "autoswitch": {
+                "threshold": 90.0,
+                "fiveHourThreshold": five_hour,
+                "sevenDayThreshold": seven_day,
+            }
+        }))
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            screen = app.screen
+            await pilot.press("t", "right")
+            await pilot.pause()
+
+            assert screen._adjusting is False
+            assert screen._settings.five_hour_threshold == five_hour
+            assert screen._settings.seven_day_threshold == seven_day
+            assert fake_engine.instances[0].applied_thresholds == []
+            assert app.threshold_pct == bar_threshold
+
     async def test_threshold_clamps_and_keeps_meaningful_decimals(
         self, tmp_path, fake_engine
     ):
@@ -1471,9 +1503,9 @@ class TestAutoScreen:
             summary = screen.query_one("#auto-summary", Static)
             # never a lying "100%"
             assert "threshold 99.9% (session)" in summary.render().plain
-            screen.action_threshold_step(-60.0)
+            screen.action_threshold_step(-100.0)
             await pilot.pause()
-            assert screen._settings.threshold == 50.0  # spec's lower bound
+            assert screen._settings.threshold == 1.0  # spec's lower bound
 
     async def test_candidates_ranked_by_headroom(self, tmp_path, fake_engine):
         fake = FakeSwitcher(
@@ -1527,6 +1559,36 @@ class TestAutoScreen:
             plain = app.screen.query_one("#candidates", Static).render().plain
             # On 5h alone #2 (10% used) would rank first; Fable 95% binds it
             # below #3 (50% binding).
+            assert plain.index("user3@example.com") < plain.index(
+                "user2@example.com"
+            )
+
+    async def test_candidates_rank_by_split_threshold_runway(
+        self, tmp_path, fake_engine
+    ):
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "autoswitch": {
+                "fiveHourThreshold": 94.0,
+                "sevenDayThreshold": 98.0,
+            }
+        }))
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(94.0, 20.0)),
+                make_account(2, entry=make_entry(93.0, 20.0)),  # runway 1
+                make_account(3, entry=make_entry(20.0, 96.0)),  # runway 2
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
             assert plain.index("user3@example.com") < plain.index(
                 "user2@example.com"
             )
@@ -1709,4 +1771,3 @@ class TestThemeWiring:
             await menu_select(pilot, "theme:light")
             assert app._theme_name == "light"
             assert app.theme == "cswap-light"
-
