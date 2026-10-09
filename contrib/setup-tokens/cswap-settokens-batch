@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Register many setup-tokens at once (this machine + peers) via cswap-settoken.
+# Input file: one account per line, "<email> <token>" (any whitespace; blank lines and
+# #comments ignored). The slot is looked up from the email in cswap's sequence.json, so
+# existing slot numbers are kept. Each token is length- and auth-checked by
+# cswap-settoken before anything changes. The file is shredded afterwards.
+# Usage: cswap-settokens-batch ~/cswap-tokens.txt
+set -uo pipefail
+src="${1:?usage: cswap-settokens-batch <file>}"
+[ -f "$src" ] || { echo "No such file: $src" >&2; exit 1; }
+chmod 600 "$src"
+seq=~/.local/share/claude-swap/sequence.json
+ok=(); bad=()
+while read -r email tok _rest; do
+  [[ -z "${email:-}" || "$email" == \#* ]] && continue
+  email="${email%%[:,]}"   # tolerate "email: token" / "email, token"
+  [[ -z "${tok:-}" ]] && { echo "-- $email: no token on its line, skipped"; continue; }
+  slot=$(jq -r --arg e "$email" '.accounts | to_entries[] | select(.value.email == $e) | .key' "$seq" | head -1)
+  if [[ -z "$slot" ]]; then
+    echo "!! $email: no cswap slot with that email — skipped"; bad+=("$email (no slot)"); continue
+  fi
+  echo "### slot $slot  $email"
+  out=$(printf "%s\n" "${tok:-}" | PATH=$(dirname "$0"):$HOME/.local/bin:$PATH cswap-settoken "$slot" "$email" 2>&1); rc=$?
+  printf "%s\n" "$out" | sed -E "s/sk-ant-[A-Za-z0-9_-]+/<token>/g" | grep -v "^Paste setup-token"
+  if [ $rc -eq 0 ]; then ok+=("$slot $email"); else bad+=("$slot $email"); fi
+done < "$src"
+shred -u "$src" 2>/dev/null || rm -f "$src"
+echo; echo "(shredded $src)"
+echo "Done: ${#ok[@]} ok, ${#bad[@]} failed"
+for b in "${bad[@]}"; do echo "  FAILED: $b"; done

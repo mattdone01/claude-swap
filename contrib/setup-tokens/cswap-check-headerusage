@@ -1,0 +1,10 @@
+#!/bin/sh
+# Exit non-zero (with a loud message) if the installed cswap lacks the setup-token
+# header-usage change (claude-swap commit b117401).
+py="$HOME/.local/share/uv/tools/claude-swap/bin/python"
+if "$py" -c "import claude_swap.oauth as o, sys; sys.exit(0 if hasattr(o, 'is_setup_token') else 1)" 2>/dev/null; then
+  echo "cswap: setup-token header usage present"
+else
+  echo "WARNING: cswap was rebuilt WITHOUT setup-token header usage (claude-swap commit b117401). Setup-token accounts will show no usage and will not auto-switch. Rebuild from a branch containing b117401." >&2
+  exit 1
+fi

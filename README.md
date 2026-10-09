@@ -361,6 +361,8 @@ cswap add-token - --slot 3                   # read token from stdin
 cswap add-token --email user@example.com     # optional label override
 ```
 
+To run the same accounts on several machines, see [contrib/setup-tokens](contrib/setup-tokens/README.md): setup-tokens never rotate, so one token can be live everywhere, and cswap reads their usage from rate-limit headers.
+
 `--email` is optional; omitted values use `setup-token-{slot}@token.local`
 (or `api-key-{slot}@token.local` for API keys). No Anthropic API calls are made.
 

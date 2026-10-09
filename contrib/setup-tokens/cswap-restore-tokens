@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Re-import every setup-token backed up by cswap-settoken (~/.config/cswap-backup/slot-*.json)
+# into this machine's cswap. Use after a `cswap purge`, a wiped data dir, or a fresh install.
+# Only setup-tokens are backed up there: they never rotate, so the backups stay valid.
+set -euo pipefail
+b=~/.config/cswap-backup; cs=~/.local/bin/cswap
+shopt -s nullglob
+files=("$b"/slot-*.json)
+[ ${#files[@]} -gt 0 ] || { echo "No backups in $b"; exit 0; }
+for f in "${files[@]}"; do
+  "$cs" import "$f" --force </dev/null 2>&1 | grep -E "Imported|Overwrote|rror" || true
+done
+"$cs" refresh </dev/null 2>&1 | grep -E "^Account-" | sed -E "s/; cached measurement.*//"

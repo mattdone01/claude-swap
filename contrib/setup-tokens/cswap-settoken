@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Register a `claude setup-token` for one cswap slot on this machine AND every peer,
+# and back it up to ~/.config/cswap-backup/ on each (outside cswap's own data dir, so a
+# rebuild or `cswap purge` can't lose it; restore with cswap-restore-tokens).
+#
+# Setup-tokens never rotate, so the same token can be live on several machines at once
+# and the backup stays valid until the token itself expires (~1 year).
+#
+# Peers: SSH targets, one per line, in ~/.config/cswap-backup/peers (or space-separated
+# in $CSWAP_PEERS). Each needs cswap installed and non-interactive SSH access.
+#
+# Usage: cswap-settoken <slot> <email>     (then paste the token; it is not echoed)
+set -euo pipefail
+slot="${1:?usage: cswap-settoken <slot> <email>}"; email="${2:?usage: cswap-settoken <slot> <email>}"
+read -rsp "Paste setup-token for slot $slot ($email): " tok; echo
+[[ "$tok" == sk-ant-oat01-* ]] || { echo "That does not look like a setup-token (sk-ant-oat01-...)." >&2; exit 1; }
+# A double paste still starts with the prefix, so also check the length and that it authenticates.
+n=$(grep -o "sk-ant-oat01-" <<<"$tok" | wc -l)
+if [ "${#tok}" -ne 108 ] || [ "$n" -ne 1 ]; then
+  echo "Token is ${#tok} chars with $n prefix(es); a setup-token is 108 chars with one. Pasted twice? Nothing was changed." >&2; exit 1
+fi
+code=$(curl -s -o /dev/null -w "%{http_code}" https://api.anthropic.com/v1/messages \
+  -H "Authorization: Bearer $tok" -H "anthropic-version: 2023-06-01" -H "anthropic-beta: oauth-2025-04-20" \
+  -H "content-type: application/json" \
+  -d "{\"model\":\"claude-haiku-4-5-20251001\",\"max_tokens\":1,\"messages\":[{\"role\":\"user\",\"content\":\".\"}]}")
+case "$code" in
+  200|429) echo "Token authenticates (HTTP $code)." ;;
+  *) echo "Token rejected by Anthropic (HTTP $code). Nothing was changed." >&2; exit 1 ;;
+esac
+
+# Runs on each target host; the token arrives on stdin.
+read -r -d '' REGISTER <<'R' || true
+set -e; slot="$1"; email="$2"; tok="$(cat)"; cs=~/.local/bin/cswap
+cur="$(jq -r --arg s "$slot" '.accounts[$s].email // empty' ~/.local/share/claude-swap/sequence.json 2>/dev/null || true)"
+if [ -n "$cur" ]; then echo y | "$cs" remove "$slot" >/dev/null; fi
+printf "%s" "$tok" | "$cs" add-token - --slot "$slot" --email "$email" | sed -E "s/sk-ant-[A-Za-z0-9_-]+/<token>/g"
+f=~/.local/share/claude-swap/cache/usage.json
+if [ -f "$f" ]; then
+  jq --arg s "$slot" 'if .accounts[$s] then .accounts[$s] |= (.backoffUntil = 0 | .consecutiveFailures = 0 | .lastError = null) else . end' "$f" > "$f.new" && cat "$f.new" > "$f" && rm -f "$f.new"
+fi
+b=~/.config/cswap-backup; mkdir -p "$b"; chmod 700 "$b"
+rm -f "$b/slot-$slot.json"; (umask 077; "$cs" export "$b/slot-$slot.json" --account "$slot" </dev/null >/dev/null)
+echo "backed up -> $b/slot-$slot.json"
+"$cs" refresh </dev/null 2>&1 | grep "Account-$slot " | sed -E "s/; cached measurement.*//"
+R
+
+peers=()
+if [ -n "${CSWAP_PEERS:-}" ]; then
+  read -r -a peers <<<"$CSWAP_PEERS"
+elif [ -f ~/.config/cswap-backup/peers ]; then
+  while read -r p _; do [[ -n "$p" && "$p" != \#* ]] && peers+=("$p"); done < ~/.config/cswap-backup/peers
+fi
+
+for host in local "${peers[@]}"; do
+  echo "== $host"
+  if [ "$host" = local ]; then
+    printf "%s" "$tok" | bash -c "$REGISTER" _ "$slot" "$email"
+  else
+    printf "%s" "$tok" | ssh -o BatchMode=yes "$host" "bash -c $(printf %q "$REGISTER") _ $slot $email"
+  fi
+done
+unset tok
